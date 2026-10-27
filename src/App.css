@@ -401,16 +401,130 @@
 
 .contacted-row {
   display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 0.4rem;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
   margin-bottom: 1.5rem;
+}
+
+.contacted-row .contacted-hint {
+  flex-basis: 100%;
 }
 
 .contacted-hint {
   margin: 0;
   font-size: 0.8rem;
   color: var(--muted);
+}
+
+.form-context {
+  margin: -0.5rem 0 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.reminders-board {
+  overflow-y: auto;
+  flex: 1;
+  padding: 0.25rem 0.5rem 0.75rem;
+}
+
+.reminder-group {
+  margin-bottom: 0.75rem;
+}
+
+.reminder-group-title {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0.5rem 0.5rem 0.35rem;
+  font-family: var(--sans);
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.reminder-group-count {
+  min-width: 1.2rem;
+  height: 1.2rem;
+  padding: 0 0.3rem;
+  border-radius: 999px;
+  background: var(--hover);
+  color: var(--text-h);
+  font-size: 0.65rem;
+  display: inline-grid;
+  place-items: center;
+}
+
+.reminder-group-list {
+  padding: 0;
+  overflow: visible;
+  flex: none;
+}
+
+.reminder-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.profile-reminders {
+  margin-bottom: 1.75rem;
+}
+
+.profile-reminders h3 {
+  margin: 0 0 0.65rem;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  font-weight: 600;
+  font-family: var(--sans);
+}
+
+.profile-reminder-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.profile-reminder-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.75rem 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.profile-reminder-reason {
+  margin: 0 0 0.25rem;
+  color: var(--text-h);
+  font-weight: 600;
+}
+
+.profile-reminder-due {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.profile-reminder-actions {
+  display: flex;
+  gap: 0.4rem;
 }
 
 @media (prefers-color-scheme: dark) {

@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react'
 import './App.css'
 
-const STORAGE_KEY = 'peoplesnote-contacts'
+const CONTACTS_KEY = 'peoplesnote-contacts'
+const REMINDERS_KEY = 'peoplesnote-reminders'
 const FOLLOW_UP_OPTIONS = [7, 30, 60]
 
 /**
- * Seed data used only when localStorage is empty (first visit).
- * followUpDays = how often you want to reconnect (7 / 30 / 60).
+ * Seed contacts only when localStorage has none yet.
+ * Existing saved contacts are never overwritten by this list.
  */
 const SAMPLE_CONTACTS = [
   {
@@ -82,7 +83,11 @@ const EMPTY_FORM = {
   followUpDays: '30',
 }
 
-/** Local calendar date as YYYY-MM-DD (avoids UTC off-by-one). */
+const EMPTY_REMINDER_FORM = {
+  reason: '',
+  dueDate: '',
+}
+
 function todayISO() {
   const d = new Date()
   const y = d.getFullYear()
@@ -91,7 +96,6 @@ function todayISO() {
   return `${y}-${m}-${day}`
 }
 
-/** Add days to a YYYY-MM-DD string; returns another YYYY-MM-DD. */
 function addDays(isoDate, days) {
   const [y, m, d] = isoDate.split('-').map(Number)
   const date = new Date(y, m - 1, d)
@@ -102,11 +106,7 @@ function addDays(isoDate, days) {
   return `${yy}-${mm}-${dd}`
 }
 
-/**
- * Next follow-up due date.
- * No last-contact → due today (treat as never contacted).
- */
-function getDueDate(contact) {
+function getContactDueDate(contact) {
   if (!contact.lastContacted) return todayISO()
   const days = FOLLOW_UP_OPTIONS.includes(contact.followUpDays)
     ? contact.followUpDays
@@ -114,15 +114,28 @@ function getDueDate(contact) {
   return addDays(contact.lastContacted, days)
 }
 
-function getDueStatus(contact) {
-  const due = getDueDate(contact)
+function getContactDueStatus(contact) {
+  const due = getContactDueDate(contact)
   const today = todayISO()
   if (due < today) return 'overdue'
   if (due === today) return 'due-today'
   return 'upcoming'
 }
 
-/** Ensure older saved contacts get a valid followUpDays. */
+/** Bucket a reminder by its dueDate vs today. */
+function getReminderStatus(reminder) {
+  const today = todayISO()
+  if (reminder.dueDate < today) return 'overdue'
+  if (reminder.dueDate === today) return 'due-today'
+  return 'upcoming'
+}
+
+function dueLabel(status) {
+  if (status === 'overdue') return 'Overdue'
+  if (status === 'due-today') return 'Today'
+  return 'Upcoming'
+}
+
 function normalizeContact(contact) {
   const followUpDays = FOLLOW_UP_OPTIONS.includes(contact.followUpDays)
     ? contact.followUpDays
@@ -137,13 +150,33 @@ function normalizeContact(contact) {
 
 function loadContacts() {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
+    const raw = localStorage.getItem(CONTACTS_KEY)
     if (!raw) return SAMPLE_CONTACTS.map(normalizeContact)
     const parsed = JSON.parse(raw)
     if (!Array.isArray(parsed)) return SAMPLE_CONTACTS.map(normalizeContact)
     return parsed.map(normalizeContact)
   } catch {
     return SAMPLE_CONTACTS.map(normalizeContact)
+  }
+}
+
+/** Separate key so existing contact data is never wiped. */
+function loadReminders() {
+  try {
+    const raw = localStorage.getItem(REMINDERS_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter(
+      (r) =>
+        r &&
+        typeof r.id !== 'undefined' &&
+        typeof r.contactId !== 'undefined' &&
+        typeof r.reason === 'string' &&
+        typeof r.dueDate === 'string',
+    )
+  } catch {
+    return []
   }
 }
 
@@ -167,26 +200,32 @@ function formatLastContacted(lastContacted) {
   return lastContacted ? lastContacted : 'Never contacted'
 }
 
-function dueLabel(status) {
-  if (status === 'overdue') return 'Overdue'
-  if (status === 'due-today') return 'Due today'
-  return 'Upcoming'
+function sortByDueDate(a, b) {
+  return a.dueDate.localeCompare(b.dueDate)
 }
 
 function App() {
   const [contacts, setContacts] = useState(loadContacts)
+  const [reminders, setReminders] = useState(loadReminders)
   const [searchQuery, setSearchQuery] = useState('')
   const [selectedId, setSelectedId] = useState(
     () => loadContacts()[0]?.id ?? null,
   )
+  const [selectedReminderId, setSelectedReminderId] = useState(null)
   const [activeNav, setActiveNav] = useState('people')
   const [formMode, setFormMode] = useState(null)
   const [form, setForm] = useState(EMPTY_FORM)
+  const [reminderForm, setReminderForm] = useState(EMPTY_REMINDER_FORM)
 
-  // Same persistence path as before — reminders just add fields on each contact.
+  // Contacts stay on their original key — preserves existing people.
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(contacts))
+    localStorage.setItem(CONTACTS_KEY, JSON.stringify(contacts))
   }, [contacts])
+
+  // Reminders live on a separate key.
+  useEffect(() => {
+    localStorage.setItem(REMINDERS_KEY, JSON.stringify(reminders))
+  }, [reminders])
 
   const filteredContacts = contacts.filter((contact) => {
     const q = searchQuery.toLowerCase().trim()
@@ -198,31 +237,53 @@ function App() {
     )
   })
 
-  // Overdue + due today, earliest due date first.
-  const reminderContacts = contacts
-    .filter((c) => {
-      const status = getDueStatus(c)
-      return status === 'overdue' || status === 'due-today'
-    })
-    .sort((a, b) => getDueDate(a).localeCompare(getDueDate(b)))
+  // Open reminders only — completed ones stay saved but leave the queues.
+  const openReminders = reminders
+    .filter((r) => !r.completed)
+    .sort(sortByDueDate)
 
-  const listContacts =
-    activeNav === 'reminders' ? reminderContacts : filteredContacts
+  const overdueReminders = openReminders.filter(
+    (r) => getReminderStatus(r) === 'overdue',
+  )
+  const todayReminders = openReminders.filter(
+    (r) => getReminderStatus(r) === 'due-today',
+  )
+  const upcomingReminders = openReminders.filter(
+    (r) => getReminderStatus(r) === 'upcoming',
+  )
+
+  const needsAttentionCount = overdueReminders.length + todayReminders.length
 
   const selectedContact =
     contacts.find((c) => c.id === selectedId) || null
 
+  const selectedReminder =
+    openReminders.find((r) => r.id === selectedReminderId) || null
+
+  const selectedReminderContact = selectedReminder
+    ? contacts.find((c) => c.id === selectedReminder.contactId) || null
+    : null
+
+  const contactOpenReminders = selectedContact
+    ? openReminders.filter((r) => r.contactId === selectedContact.id)
+    : []
+
   const selectedDue = selectedContact
     ? {
-        date: getDueDate(selectedContact),
-        status: getDueStatus(selectedContact),
+        date: getContactDueDate(selectedContact),
+        status: getContactDueStatus(selectedContact),
       }
     : null
+
+  function contactName(contactId) {
+    return contacts.find((c) => c.id === contactId)?.name || 'Unknown person'
+  }
 
   function openAddForm() {
     setActiveNav('people')
     setForm(EMPTY_FORM)
     setFormMode('add')
+    setSelectedReminderId(null)
   }
 
   function openEditForm() {
@@ -239,14 +300,29 @@ function App() {
     setFormMode('edit')
   }
 
+  function openReminderForm() {
+    if (!selectedContact) return
+    setReminderForm({
+      reason: '',
+      dueDate: todayISO(),
+    })
+    setFormMode('reminder')
+  }
+
   function cancelForm() {
     setFormMode(null)
     setForm(EMPTY_FORM)
+    setReminderForm(EMPTY_REMINDER_FORM)
   }
 
   function handleFormChange(e) {
     const { name, value } = e.target
     setForm((prev) => ({ ...prev, [name]: value }))
+  }
+
+  function handleReminderFormChange(e) {
+    const { name, value } = e.target
+    setReminderForm((prev) => ({ ...prev, [name]: value }))
   }
 
   function handleFormSubmit(e) {
@@ -287,6 +363,26 @@ function App() {
     setForm(EMPTY_FORM)
   }
 
+  function handleReminderSubmit(e) {
+    e.preventDefault()
+    if (!selectedContact) return
+    const reason = reminderForm.reason.trim()
+    const dueDate = reminderForm.dueDate
+    if (!reason || !dueDate) return
+
+    // One-shot reminder — completing it later will NOT spawn another.
+    const newReminder = {
+      id: Date.now(),
+      contactId: selectedContact.id,
+      reason,
+      dueDate,
+      completed: false,
+    }
+    setReminders((prev) => [...prev, newReminder])
+    setFormMode(null)
+    setReminderForm(EMPTY_REMINDER_FORM)
+  }
+
   function handleDelete() {
     if (!selectedContact) return
     const ok = window.confirm(
@@ -296,11 +392,15 @@ function App() {
 
     const next = contacts.filter((c) => c.id !== selectedContact.id)
     setContacts(next)
+    // Drop reminders tied to the deleted person.
+    setReminders((prev) =>
+      prev.filter((r) => r.contactId !== selectedContact.id),
+    )
     setSelectedId(next[0]?.id ?? null)
+    setSelectedReminderId(null)
     setFormMode(null)
   }
 
-  /** Sets lastContacted to today → next due becomes today + interval. */
   function handleContactedToday() {
     if (!selectedContact) return
     setContacts((prev) =>
@@ -312,17 +412,93 @@ function App() {
     )
   }
 
+  /** Mark done — stays completed; no automatic next reminder. */
+  function completeReminder(reminderId) {
+    setReminders((prev) =>
+      prev.map((r) =>
+        r.id === reminderId ? { ...r, completed: true } : r,
+      ),
+    )
+    if (selectedReminderId === reminderId) {
+      setSelectedReminderId(null)
+    }
+  }
+
+  /** Push due date to tomorrow; reminder stays open. */
+  function snoozeReminder(reminderId) {
+    const tomorrow = addDays(todayISO(), 1)
+    setReminders((prev) =>
+      prev.map((r) =>
+        r.id === reminderId ? { ...r, dueDate: tomorrow } : r,
+      ),
+    )
+  }
+
   function selectContact(id) {
     setSelectedId(id)
+    setSelectedReminderId(null)
+    setFormMode(null)
+  }
+
+  function selectReminder(reminder) {
+    setSelectedReminderId(reminder.id)
+    setSelectedId(reminder.contactId)
     setFormMode(null)
   }
 
   function handleNavClick(id) {
     setActiveNav(id)
     setFormMode(null)
-    if (id === 'reminders' && reminderContacts[0]) {
-      setSelectedId(reminderContacts[0].id)
+    if (id === 'reminders') {
+      const first =
+        overdueReminders[0] || todayReminders[0] || upcomingReminders[0]
+      setSelectedReminderId(first?.id ?? null)
+      if (first) setSelectedId(first.contactId)
+    } else {
+      setSelectedReminderId(null)
     }
+  }
+
+  function renderReminderGroup(title, items, status) {
+    if (items.length === 0) return null
+    return (
+      <div className="reminder-group" key={title}>
+        <h3 className="reminder-group-title">
+          {title}
+          <span className="reminder-group-count">{items.length}</span>
+        </h3>
+        <ul className="contact-list reminder-group-list">
+          {items.map((reminder) => (
+            <li key={reminder.id}>
+              <button
+                type="button"
+                className={
+                  selectedReminderId === reminder.id
+                    ? 'contact-row is-selected'
+                    : 'contact-row'
+                }
+                onClick={() => selectReminder(reminder)}
+              >
+                <span className="avatar" aria-hidden="true">
+                  {initials(contactName(reminder.contactId))}
+                </span>
+                <span className="contact-meta">
+                  <span className="contact-name">
+                    {contactName(reminder.contactId)}
+                  </span>
+                  <span className="contact-sub">
+                    {reminder.reason} · {reminder.dueDate}
+                  </span>
+                </span>
+                <span className={`due-badge due-badge--${status}`}>
+                  {dueLabel(status)}
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      </div>
+    )
   }
 
   return (
@@ -346,8 +522,8 @@ function App() {
               onClick={() => handleNavClick(item.id)}
             >
               {item.label}
-              {item.id === 'reminders' && reminderContacts.length > 0 && (
-                <span className="nav-count">{reminderContacts.length}</span>
+              {item.id === 'reminders' && needsAttentionCount > 0 && (
+                <span className="nav-count">{needsAttentionCount}</span>
               )}
             </button>
           ))}
@@ -360,7 +536,7 @@ function App() {
         <header className="list-header">
           <div className="list-title-row">
             <h1>{activeNav === 'reminders' ? 'Reminders' : 'People'}</h1>
-            {activeNav !== 'reminders' && (
+            {activeNav === 'people' && (
               <button
                 type="button"
                 className="btn btn-primary"
@@ -373,7 +549,7 @@ function App() {
 
           {activeNav === 'reminders' ? (
             <p className="list-subtitle">
-              Overdue and due today · earliest first
+              Overdue, today, and upcoming · earliest first
             </p>
           ) : activeNav === 'tags' ? (
             <p className="list-subtitle">Tags view coming soon</p>
@@ -390,21 +566,38 @@ function App() {
           )}
         </header>
 
-        <ul className="contact-list">
-          {activeNav === 'tags' ? (
+        {activeNav === 'tags' ? (
+          <ul className="contact-list">
             <li className="empty">Tag browsing is not built yet.</li>
-          ) : listContacts.length === 0 ? (
-            <li className="empty">
-              {activeNav === 'reminders'
-                ? 'You’re all caught up — nothing due today.'
-                : contacts.length === 0
+          </ul>
+        ) : activeNav === 'reminders' ? (
+          <div className="reminders-board">
+            {openReminders.length === 0 ? (
+              <p className="empty">
+                No open reminders. Add one from a contact’s profile.
+              </p>
+            ) : (
+              <>
+                {renderReminderGroup('Overdue', overdueReminders, 'overdue')}
+                {renderReminderGroup('Today', todayReminders, 'due-today')}
+                {renderReminderGroup(
+                  'Upcoming',
+                  upcomingReminders,
+                  'upcoming',
+                )}
+              </>
+            )}
+          </div>
+        ) : (
+          <ul className="contact-list">
+            {filteredContacts.length === 0 ? (
+              <li className="empty">
+                {contacts.length === 0
                   ? 'No people yet — add someone.'
                   : `No contacts match “${searchQuery}”`}
-            </li>
-          ) : (
-            listContacts.map((contact) => {
-              const status = getDueStatus(contact)
-              return (
+              </li>
+            ) : (
+              filteredContacts.map((contact) => (
                 <li key={contact.id}>
                   <button
                     type="button"
@@ -420,27 +613,59 @@ function App() {
                     </span>
                     <span className="contact-meta">
                       <span className="contact-name">{contact.name}</span>
-                      <span className="contact-sub">
-                        {activeNav === 'reminders'
-                          ? `Due ${getDueDate(contact)} · every ${contact.followUpDays}d`
-                          : contact.company}
-                      </span>
+                      <span className="contact-sub">{contact.company}</span>
                     </span>
-                    {activeNav === 'reminders' && (
-                      <span className={`due-badge due-badge--${status}`}>
-                        {dueLabel(status)}
-                      </span>
-                    )}
                   </button>
                 </li>
-              )
-            })
-          )}
-        </ul>
+              ))
+            )}
+          </ul>
+        )}
       </section>
 
       <main className="detail-pane" aria-label="Contact details">
-        {formMode ? (
+        {formMode === 'reminder' && selectedContact ? (
+          <form className="contact-form" onSubmit={handleReminderSubmit}>
+            <h2>Add reminder</h2>
+            <p className="form-context">For {selectedContact.name}</p>
+
+            <label>
+              Reason
+              <input
+                name="reason"
+                value={reminderForm.reason}
+                onChange={handleReminderFormChange}
+                placeholder="e.g. Check in about the proposal"
+                required
+                autoFocus
+              />
+            </label>
+
+            <label>
+              Due date
+              <input
+                name="dueDate"
+                type="date"
+                value={reminderForm.dueDate}
+                onChange={handleReminderFormChange}
+                required
+              />
+            </label>
+
+            <div className="form-actions">
+              <button type="submit" className="btn btn-primary">
+                Save reminder
+              </button>
+              <button
+                type="button"
+                className="btn btn-ghost"
+                onClick={cancelForm}
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        ) : formMode === 'add' || formMode === 'edit' ? (
           <form className="contact-form" onSubmit={handleFormSubmit}>
             <h2>{formMode === 'add' ? 'Add person' : 'Edit person'}</h2>
 
@@ -532,6 +757,76 @@ function App() {
               </button>
             </div>
           </form>
+        ) : activeNav === 'reminders' && selectedReminder ? (
+          <>
+            <header className="detail-header">
+              <div className="detail-avatar" aria-hidden="true">
+                {initials(
+                  selectedReminderContact?.name ||
+                    contactName(selectedReminder.contactId),
+                )}
+              </div>
+              <div className="detail-heading">
+                <h2>
+                  {selectedReminderContact?.name ||
+                    contactName(selectedReminder.contactId)}
+                </h2>
+                <p className="detail-company">Reminder</p>
+              </div>
+            </header>
+
+            <dl className="detail-fields">
+              <div>
+                <dt>Reason</dt>
+                <dd>{selectedReminder.reason}</dd>
+              </div>
+              <div>
+                <dt>Due</dt>
+                <dd className="due-line">
+                  <span>{selectedReminder.dueDate}</span>
+                  <span
+                    className={`due-badge due-badge--${getReminderStatus(selectedReminder)}`}
+                  >
+                    {dueLabel(getReminderStatus(selectedReminder))}
+                  </span>
+                </dd>
+              </div>
+            </dl>
+
+            <div className="reminder-actions">
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={() => completeReminder(selectedReminder.id)}
+              >
+                Mark complete
+              </button>
+              <button
+                type="button"
+                className="btn btn-ghost"
+                onClick={() => snoozeReminder(selectedReminder.id)}
+              >
+                Snooze until tomorrow
+              </button>
+              {selectedReminderContact && (
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  onClick={() => {
+                    setActiveNav('people')
+                    setSelectedId(selectedReminderContact.id)
+                    setSelectedReminderId(null)
+                  }}
+                >
+                  Open contact
+                </button>
+              )}
+            </div>
+            <p className="contacted-hint">
+              Completing ends this reminder — it will not create another
+              automatically.
+            </p>
+          </>
         ) : selectedContact ? (
           <>
             <header className="detail-header">
@@ -578,7 +873,7 @@ function App() {
                 <dd>{selectedContact.followUpDays} days</dd>
               </div>
               <div>
-                <dt>Next due</dt>
+                <dt>Cadence next due</dt>
                 <dd className="due-line">
                   <span>{selectedDue.date}</span>
                   <span
@@ -598,10 +893,59 @@ function App() {
               >
                 Contacted today
               </button>
+              <button
+                type="button"
+                className="btn btn-ghost"
+                onClick={openReminderForm}
+              >
+                Add reminder
+              </button>
               <p className="contacted-hint">
-                Sets last contact to today and pushes the next due date forward.
+                Reminders are one-shot tasks with a reason and due date. Cadence
+                follow-ups stay separate.
               </p>
             </div>
+
+            {contactOpenReminders.length > 0 && (
+              <section className="profile-reminders">
+                <h3>Open reminders</h3>
+                <ul className="profile-reminder-list">
+                  {contactOpenReminders.map((reminder) => (
+                    <li key={reminder.id} className="profile-reminder-item">
+                      <div>
+                        <p className="profile-reminder-reason">
+                          {reminder.reason}
+                        </p>
+                        <p className="profile-reminder-due">
+                          Due {reminder.dueDate}
+                          <span
+                            className={`due-badge due-badge--${getReminderStatus(reminder)}`}
+                          >
+                            {dueLabel(getReminderStatus(reminder))}
+                          </span>
+                        </p>
+                      </div>
+                      <div className="profile-reminder-actions">
+                        <button
+                          type="button"
+                          className="btn btn-primary"
+                          onClick={() => completeReminder(reminder.id)}
+                        >
+                          Complete
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-ghost"
+                          onClick={() => snoozeReminder(reminder.id)}
+                        >
+                          Snooze
+                        </button>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            )}
 
             {selectedContact.tags.length > 0 && (
               <div className="detail-tags">
@@ -620,7 +964,9 @@ function App() {
           </>
         ) : (
           <p className="empty">
-            No contact selected. Add a person or pick one from the list.
+            {activeNav === 'reminders'
+              ? 'Select a reminder, or add one from a contact’s profile.'
+              : 'No contact selected. Add a person or pick one from the list.'}
           </p>
         )}
       </main>
