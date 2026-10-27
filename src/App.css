@@ -62,6 +62,23 @@
   font-size: 0.95rem;
   color: var(--text);
   cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.nav-count {
+  min-width: 1.35rem;
+  height: 1.35rem;
+  padding: 0 0.35rem;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.7rem;
+  font-weight: 700;
+  display: inline-grid;
+  place-items: center;
 }
 
 .nav-item:hover {
@@ -110,6 +127,12 @@
   font-weight: 600;
   letter-spacing: -0.03em;
   color: var(--text-h);
+}
+
+.list-subtitle {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--muted);
 }
 
 /* Shared buttons */
@@ -319,7 +342,8 @@
 }
 
 .contact-form input,
-.contact-form textarea {
+.contact-form textarea,
+.contact-form select {
   width: 100%;
   padding: 0.55rem 0.75rem;
   border: 1px solid var(--border);
@@ -335,9 +359,70 @@
 }
 
 .contact-form input:focus,
-.contact-form textarea:focus {
+.contact-form textarea:focus,
+.contact-form select:focus {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
+}
+
+.due-line {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.due-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  flex-shrink: 0;
+}
+
+.due-badge--overdue {
+  background: rgba(184, 59, 59, 0.12);
+  color: #b83b3b;
+}
+
+.due-badge--due-today {
+  background: rgba(180, 120, 20, 0.14);
+  color: #9a6b10;
+}
+
+.due-badge--upcoming {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.contacted-row {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.4rem;
+  margin-bottom: 1.5rem;
+}
+
+.contacted-hint {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+@media (prefers-color-scheme: dark) {
+  .due-badge--overdue {
+    background: rgba(240, 160, 160, 0.14);
+    color: #f0a0a0;
+  }
+
+  .due-badge--due-today {
+    background: rgba(230, 180, 80, 0.16);
+    color: #e6b450;
+  }
 }
 
 .form-actions {

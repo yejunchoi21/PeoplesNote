@@ -2,9 +2,11 @@ import { useEffect, useState } from 'react'
 import './App.css'
 
 const STORAGE_KEY = 'peoplesnote-contacts'
+const FOLLOW_UP_OPTIONS = [7, 30, 60]
 
 /**
  * Seed data used only when localStorage is empty (first visit).
+ * followUpDays = how often you want to reconnect (7 / 30 / 60).
  */
 const SAMPLE_CONTACTS = [
   {
@@ -16,6 +18,7 @@ const SAMPLE_CONTACTS = [
     tags: ['work', 'mentor'],
     notes: 'Met at React meetup. Prefers async updates.',
     lastContacted: '2026-10-12',
+    followUpDays: 30,
   },
   {
     id: 2,
@@ -26,6 +29,7 @@ const SAMPLE_CONTACTS = [
     tags: ['friend'],
     notes: 'Coffee next time they are in town.',
     lastContacted: '2026-09-28',
+    followUpDays: 60,
   },
   {
     id: 3,
@@ -36,6 +40,7 @@ const SAMPLE_CONTACTS = [
     tags: ['client', 'follow-up'],
     notes: 'Sent proposal draft. Waiting on feedback.',
     lastContacted: '2026-10-20',
+    followUpDays: 7,
   },
   {
     id: 4,
@@ -46,6 +51,7 @@ const SAMPLE_CONTACTS = [
     tags: ['work'],
     notes: 'Introduced me to the design team.',
     lastContacted: '2026-08-15',
+    followUpDays: 30,
   },
   {
     id: 5,
@@ -55,7 +61,8 @@ const SAMPLE_CONTACTS = [
     company: 'Independent',
     tags: ['friend', 'college'],
     notes: 'Birthday in November. Loves hiking.',
-    lastContacted: '2026-07-02',
+    lastContacted: '',
+    followUpDays: 60,
   },
 ]
 
@@ -72,21 +79,74 @@ const EMPTY_FORM = {
   phone: '',
   tags: '',
   notes: '',
+  followUpDays: '30',
 }
 
-/** Read contacts from localStorage, or fall back to sample data. */
-function loadContacts() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return SAMPLE_CONTACTS
-    const parsed = JSON.parse(raw)
-    return Array.isArray(parsed) ? parsed : SAMPLE_CONTACTS
-  } catch {
-    return SAMPLE_CONTACTS
+/** Local calendar date as YYYY-MM-DD (avoids UTC off-by-one). */
+function todayISO() {
+  const d = new Date()
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
+/** Add days to a YYYY-MM-DD string; returns another YYYY-MM-DD. */
+function addDays(isoDate, days) {
+  const [y, m, d] = isoDate.split('-').map(Number)
+  const date = new Date(y, m - 1, d)
+  date.setDate(date.getDate() + days)
+  const yy = date.getFullYear()
+  const mm = String(date.getMonth() + 1).padStart(2, '0')
+  const dd = String(date.getDate()).padStart(2, '0')
+  return `${yy}-${mm}-${dd}`
+}
+
+/**
+ * Next follow-up due date.
+ * No last-contact → due today (treat as never contacted).
+ */
+function getDueDate(contact) {
+  if (!contact.lastContacted) return todayISO()
+  const days = FOLLOW_UP_OPTIONS.includes(contact.followUpDays)
+    ? contact.followUpDays
+    : 30
+  return addDays(contact.lastContacted, days)
+}
+
+function getDueStatus(contact) {
+  const due = getDueDate(contact)
+  const today = todayISO()
+  if (due < today) return 'overdue'
+  if (due === today) return 'due-today'
+  return 'upcoming'
+}
+
+/** Ensure older saved contacts get a valid followUpDays. */
+function normalizeContact(contact) {
+  const followUpDays = FOLLOW_UP_OPTIONS.includes(contact.followUpDays)
+    ? contact.followUpDays
+    : 30
+  return {
+    ...contact,
+    lastContacted: contact.lastContacted || '',
+    tags: Array.isArray(contact.tags) ? contact.tags : [],
+    followUpDays,
   }
 }
 
-/** Turn "work, mentor" into ['work', 'mentor']. */
+function loadContacts() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (!raw) return SAMPLE_CONTACTS.map(normalizeContact)
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return SAMPLE_CONTACTS.map(normalizeContact)
+    return parsed.map(normalizeContact)
+  } catch {
+    return SAMPLE_CONTACTS.map(normalizeContact)
+  }
+}
+
 function parseTags(tagsText) {
   return tagsText
     .split(',')
@@ -103,29 +163,31 @@ function initials(name) {
     .toUpperCase()
 }
 
-function todayISO() {
-  return new Date().toISOString().slice(0, 10)
+function formatLastContacted(lastContacted) {
+  return lastContacted ? lastContacted : 'Never contacted'
+}
+
+function dueLabel(status) {
+  if (status === 'overdue') return 'Overdue'
+  if (status === 'due-today') return 'Due today'
+  return 'Upcoming'
 }
 
 function App() {
-  // Lazy initializer: runs once on mount — loads from localStorage.
   const [contacts, setContacts] = useState(loadContacts)
   const [searchQuery, setSearchQuery] = useState('')
   const [selectedId, setSelectedId] = useState(
     () => loadContacts()[0]?.id ?? null,
   )
   const [activeNav, setActiveNav] = useState('people')
-
-  // null = viewing detail; 'add' | 'edit' = show the form
   const [formMode, setFormMode] = useState(null)
   const [form, setForm] = useState(EMPTY_FORM)
 
-  // Whenever contacts change, write them to localStorage.
+  // Same persistence path as before — reminders just add fields on each contact.
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(contacts))
   }, [contacts])
 
-  // Search: name, company, or tag only (not email/phone).
   const filteredContacts = contacts.filter((contact) => {
     const q = searchQuery.toLowerCase().trim()
     if (!q) return true
@@ -136,10 +198,29 @@ function App() {
     )
   })
 
+  // Overdue + due today, earliest due date first.
+  const reminderContacts = contacts
+    .filter((c) => {
+      const status = getDueStatus(c)
+      return status === 'overdue' || status === 'due-today'
+    })
+    .sort((a, b) => getDueDate(a).localeCompare(getDueDate(b)))
+
+  const listContacts =
+    activeNav === 'reminders' ? reminderContacts : filteredContacts
+
   const selectedContact =
     contacts.find((c) => c.id === selectedId) || null
 
+  const selectedDue = selectedContact
+    ? {
+        date: getDueDate(selectedContact),
+        status: getDueStatus(selectedContact),
+      }
+    : null
+
   function openAddForm() {
+    setActiveNav('people')
     setForm(EMPTY_FORM)
     setFormMode('add')
   }
@@ -153,6 +234,7 @@ function App() {
       phone: selectedContact.phone,
       tags: selectedContact.tags.join(', '),
       notes: selectedContact.notes,
+      followUpDays: String(selectedContact.followUpDays),
     })
     setFormMode('edit')
   }
@@ -172,6 +254,7 @@ function App() {
     const name = form.name.trim()
     if (!name) return
 
+    const followUpDays = Number(form.followUpDays)
     const payload = {
       name,
       company: form.company.trim(),
@@ -179,6 +262,9 @@ function App() {
       phone: form.phone.trim(),
       tags: parseTags(form.tags),
       notes: form.notes.trim(),
+      followUpDays: FOLLOW_UP_OPTIONS.includes(followUpDays)
+        ? followUpDays
+        : 30,
     }
 
     if (formMode === 'add') {
@@ -214,9 +300,29 @@ function App() {
     setFormMode(null)
   }
 
+  /** Sets lastContacted to today → next due becomes today + interval. */
+  function handleContactedToday() {
+    if (!selectedContact) return
+    setContacts((prev) =>
+      prev.map((c) =>
+        c.id === selectedContact.id
+          ? { ...c, lastContacted: todayISO() }
+          : c,
+      ),
+    )
+  }
+
   function selectContact(id) {
     setSelectedId(id)
     setFormMode(null)
+  }
+
+  function handleNavClick(id) {
+    setActiveNav(id)
+    setFormMode(null)
+    if (id === 'reminders' && reminderContacts[0]) {
+      setSelectedId(reminderContacts[0].id)
+    }
   }
 
   return (
@@ -237,9 +343,12 @@ function App() {
               className={
                 activeNav === item.id ? 'nav-item is-active' : 'nav-item'
               }
-              onClick={() => setActiveNav(item.id)}
+              onClick={() => handleNavClick(item.id)}
             >
               {item.label}
+              {item.id === 'reminders' && reminderContacts.length > 0 && (
+                <span className="nav-count">{reminderContacts.length}</span>
+              )}
             </button>
           ))}
         </nav>
@@ -250,55 +359,82 @@ function App() {
       <section className="list-pane" aria-label="Contacts">
         <header className="list-header">
           <div className="list-title-row">
-            <h1>People</h1>
-            <button
-              type="button"
-              className="btn btn-primary"
-              onClick={openAddForm}
-            >
-              Add person
-            </button>
+            <h1>{activeNav === 'reminders' ? 'Reminders' : 'People'}</h1>
+            {activeNav !== 'reminders' && (
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={openAddForm}
+              >
+                Add person
+              </button>
+            )}
           </div>
-          <label className="search">
-            <span className="visually-hidden">Search contacts</span>
-            <input
-              type="search"
-              placeholder="Search name, company, or tag…"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-            />
-          </label>
+
+          {activeNav === 'reminders' ? (
+            <p className="list-subtitle">
+              Overdue and due today · earliest first
+            </p>
+          ) : activeNav === 'tags' ? (
+            <p className="list-subtitle">Tags view coming soon</p>
+          ) : (
+            <label className="search">
+              <span className="visually-hidden">Search contacts</span>
+              <input
+                type="search"
+                placeholder="Search name, company, or tag…"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+              />
+            </label>
+          )}
         </header>
 
         <ul className="contact-list">
-          {filteredContacts.length === 0 ? (
+          {activeNav === 'tags' ? (
+            <li className="empty">Tag browsing is not built yet.</li>
+          ) : listContacts.length === 0 ? (
             <li className="empty">
-              {contacts.length === 0
-                ? 'No people yet — add someone.'
-                : `No contacts match “${searchQuery}”`}
+              {activeNav === 'reminders'
+                ? 'You’re all caught up — nothing due today.'
+                : contacts.length === 0
+                  ? 'No people yet — add someone.'
+                  : `No contacts match “${searchQuery}”`}
             </li>
           ) : (
-            filteredContacts.map((contact) => (
-              <li key={contact.id}>
-                <button
-                  type="button"
-                  className={
-                    selectedContact?.id === contact.id
-                      ? 'contact-row is-selected'
-                      : 'contact-row'
-                  }
-                  onClick={() => selectContact(contact.id)}
-                >
-                  <span className="avatar" aria-hidden="true">
-                    {initials(contact.name)}
-                  </span>
-                  <span className="contact-meta">
-                    <span className="contact-name">{contact.name}</span>
-                    <span className="contact-sub">{contact.company}</span>
-                  </span>
-                </button>
-              </li>
-            ))
+            listContacts.map((contact) => {
+              const status = getDueStatus(contact)
+              return (
+                <li key={contact.id}>
+                  <button
+                    type="button"
+                    className={
+                      selectedContact?.id === contact.id
+                        ? 'contact-row is-selected'
+                        : 'contact-row'
+                    }
+                    onClick={() => selectContact(contact.id)}
+                  >
+                    <span className="avatar" aria-hidden="true">
+                      {initials(contact.name)}
+                    </span>
+                    <span className="contact-meta">
+                      <span className="contact-name">{contact.name}</span>
+                      <span className="contact-sub">
+                        {activeNav === 'reminders'
+                          ? `Due ${getDueDate(contact)} · every ${contact.followUpDays}d`
+                          : contact.company}
+                      </span>
+                    </span>
+                    {activeNav === 'reminders' && (
+                      <span className={`due-badge due-badge--${status}`}>
+                        {dueLabel(status)}
+                      </span>
+                    )}
+                  </button>
+                </li>
+              )
+            })
           )}
         </ul>
       </section>
@@ -346,6 +482,21 @@ function App() {
                 value={form.phone}
                 onChange={handleFormChange}
               />
+            </label>
+
+            <label>
+              Follow-up every
+              <select
+                name="followUpDays"
+                value={form.followUpDays}
+                onChange={handleFormChange}
+              >
+                {FOLLOW_UP_OPTIONS.map((days) => (
+                  <option key={days} value={days}>
+                    {days} days
+                  </option>
+                ))}
+              </select>
             </label>
 
             <label>
@@ -420,9 +571,37 @@ function App() {
               </div>
               <div>
                 <dt>Last contacted</dt>
-                <dd>{selectedContact.lastContacted || '—'}</dd>
+                <dd>{formatLastContacted(selectedContact.lastContacted)}</dd>
+              </div>
+              <div>
+                <dt>Follow-up every</dt>
+                <dd>{selectedContact.followUpDays} days</dd>
+              </div>
+              <div>
+                <dt>Next due</dt>
+                <dd className="due-line">
+                  <span>{selectedDue.date}</span>
+                  <span
+                    className={`due-badge due-badge--${selectedDue.status}`}
+                  >
+                    {dueLabel(selectedDue.status)}
+                  </span>
+                </dd>
               </div>
             </dl>
+
+            <div className="contacted-row">
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={handleContactedToday}
+              >
+                Contacted today
+              </button>
+              <p className="contacted-hint">
+                Sets last contact to today and pushes the next due date forward.
+              </p>
+            </div>
 
             {selectedContact.tags.length > 0 && (
               <div className="detail-tags">
