@@ -1,4 +1,6 @@
 import { useEffect, useState } from 'react'
+import { api, setCsrfToken } from './api'
+import AuthScreen from './AuthScreen'
 import './App.css'
 
 const CONTACTS_KEY = 'peoplesnote-contacts'
@@ -199,7 +201,48 @@ function sortByDueDate(a, b) {
   return a.dueDate.localeCompare(b.dueDate)
 }
 
+/**
+ * Build tag stats from contacts: trim, skip blanks, merge case-insensitively.
+ * Counts update automatically whenever the contacts array changes.
+ */
+function buildTagStats(contactList) {
+  const map = new Map()
+
+  for (const contact of contactList) {
+    const seenOnContact = new Set()
+    for (const raw of contact.tags || []) {
+      const label = String(raw).trim()
+      if (!label) continue
+      const key = label.toLowerCase()
+      // Same tag twice on one person (e.g. "Work" and "work") counts once.
+      if (seenOnContact.has(key)) continue
+      seenOnContact.add(key)
+
+      const existing = map.get(key)
+      if (existing) {
+        existing.count += 1
+      } else {
+        map.set(key, { key, label, count: 1 })
+      }
+    }
+  }
+
+  return [...map.values()].sort((a, b) =>
+    a.label.localeCompare(b.label, undefined, { sensitivity: 'base' }),
+  )
+}
+
+function contactHasTag(contact, tagKey) {
+  return (contact.tags || []).some(
+    (tag) => String(tag).trim().toLowerCase() === tagKey,
+  )
+}
+
 function App() {
+  const [user, setUser] = useState(null)
+  const [authLoading, setAuthLoading] = useState(true)
+  const [loggingOut, setLoggingOut] = useState(false)
+
   // People list comes from Mongo via the API (starts empty until fetch).
   const [contacts, setContacts] = useState([])
   const [backupContacts] = useState(() => {
@@ -215,29 +258,81 @@ function App() {
   const [formMode, setFormMode] = useState(null)
   const [form, setForm] = useState(EMPTY_FORM)
   const [reminderForm, setReminderForm] = useState(EMPTY_REMINDER_FORM)
-  const [contactsLoading, setContactsLoading] = useState(true)
+  const [contactsLoading, setContactsLoading] = useState(false)
   const [contactsError, setContactsError] = useState('')
   const [saveError, setSaveError] = useState('')
   const [savingContact, setSavingContact] = useState(false)
   const [deletingContact, setDeletingContact] = useState(false)
   const [deleteError, setDeleteError] = useState('')
-  const [remindersLoading, setRemindersLoading] = useState(true)
+  const [remindersLoading, setRemindersLoading] = useState(false)
   const [remindersError, setRemindersError] = useState('')
   const [reminderSaveError, setReminderSaveError] = useState('')
   const [savingReminder, setSavingReminder] = useState(false)
   const [reminderBusyId, setReminderBusyId] = useState(null)
   const [importingReminders, setImportingReminders] = useState(false)
   const [importReport, setImportReport] = useState(null)
+  // Normalized (lowercase) tag key, or null when browsing all tags.
+  const [selectedTagKey, setSelectedTagKey] = useState(null)
 
-  // Load contacts + reminders from the backend on mount.
+  function clearAccountState() {
+    setContacts([])
+    setReminders([])
+    setSearchQuery('')
+    setSelectedId(null)
+    setSelectedReminderId(null)
+    setActiveNav('people')
+    setFormMode(null)
+    setForm(EMPTY_FORM)
+    setReminderForm(EMPTY_REMINDER_FORM)
+    setContactsError('')
+    setSaveError('')
+    setDeleteError('')
+    setRemindersError('')
+    setReminderSaveError('')
+    setImportReport(null)
+    setSelectedTagKey(null)
+    setContactsLoading(false)
+    setRemindersLoading(false)
+  }
+
+  // Restore session (HttpOnly cookie) — never reads tokens from localStorage.
   useEffect(() => {
+    let cancelled = false
+    async function restoreSession() {
+      setAuthLoading(true)
+      try {
+        const res = await api('/api/auth/me')
+        const data = await res.json().catch(() => ({}))
+        if (cancelled) return
+        if (data.csrfToken) setCsrfToken(data.csrfToken)
+        setUser(data.user || null)
+      } catch {
+        if (!cancelled) setUser(null)
+      } finally {
+        if (!cancelled) setAuthLoading(false)
+      }
+    }
+    restoreSession()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  // Load contacts + reminders only after login.
+  useEffect(() => {
+    if (!user) return undefined
     let cancelled = false
 
     async function fetchContacts() {
       setContactsLoading(true)
       setContactsError('')
       try {
-        const res = await fetch(API_CONTACTS)
+        const res = await api(API_CONTACTS)
+        if (res.status === 401) {
+          clearAccountState()
+          setUser(null)
+          return
+        }
         if (!res.ok) {
           throw new Error('Could not load contacts from the server.')
         }
@@ -261,7 +356,12 @@ function App() {
       setRemindersLoading(true)
       setRemindersError('')
       try {
-        const res = await fetch(API_REMINDERS)
+        const res = await api(API_REMINDERS)
+        if (res.status === 401) {
+          clearAccountState()
+          setUser(null)
+          return
+        }
         if (!res.ok) {
           throw new Error('Could not load reminders from the server.')
         }
@@ -285,7 +385,40 @@ function App() {
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [user])
+
+  async function handleLogout() {
+    setLoggingOut(true)
+    try {
+      await api('/api/auth/logout', { method: 'POST' })
+    } catch {
+      // Still clear local state even if the network call fails.
+    } finally {
+      setCsrfToken('')
+      clearAccountState()
+      setUser(null)
+      setLoggingOut(false)
+    }
+  }
+
+  if (authLoading) {
+    return (
+      <div className="auth-screen">
+        <p className="status-banner status-banner--loading">Loading…</p>
+      </div>
+    )
+  }
+
+  if (!user) {
+    return (
+      <AuthScreen
+        onAuthenticated={(nextUser) => {
+          clearAccountState()
+          setUser(nextUser)
+        }}
+      />
+    )
+  }
 
   const filteredContacts = contacts.filter((contact) => {
     const q = searchQuery.toLowerCase().trim()
@@ -313,6 +446,16 @@ function App() {
   )
 
   const needsAttentionCount = overdueReminders.length + todayReminders.length
+
+  // Derived from current contacts — stays in sync on add / edit / delete.
+  const tagStats = buildTagStats(contacts)
+  const selectedTag =
+    tagStats.find((tag) => tag.key === selectedTagKey) || null
+  const taggedContacts = selectedTagKey
+    ? contacts
+        .filter((contact) => contactHasTag(contact, selectedTagKey))
+        .sort((a, b) => a.name.localeCompare(b.name))
+    : []
 
   const selectedContact =
     contacts.find((c) => sameId(c.id, selectedId)) || null
@@ -423,7 +566,7 @@ function App() {
       setSavingContact(true)
       setSaveError('')
       try {
-        const res = await fetch(API_CONTACTS, {
+        const res = await api(API_CONTACTS, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -456,7 +599,7 @@ function App() {
       setSaveError('')
       try {
         // Keep lastContacted / reminders untouched — only profile fields change.
-        const res = await fetch(`${API_CONTACTS}/${selectedContact.id}`, {
+        const res = await api(`${API_CONTACTS}/${selectedContact.id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -498,7 +641,7 @@ function App() {
     setSavingReminder(true)
     setReminderSaveError('')
     try {
-      const res = await fetch(API_REMINDERS, {
+      const res = await api(API_REMINDERS, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -529,7 +672,7 @@ function App() {
     setRemindersError('')
     setImportReport(null)
     try {
-      const res = await fetch(`${API_REMINDERS}/import`, {
+      const res = await api(`${API_REMINDERS}/import`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -548,7 +691,7 @@ function App() {
       }
 
       // Refresh from the server so the UI matches Mongo.
-      const listRes = await fetch(API_REMINDERS)
+      const listRes = await api(API_REMINDERS)
       if (listRes.ok) {
         const list = await listRes.json()
         setReminders(
@@ -589,7 +732,7 @@ function App() {
     setDeleteError('')
     const deletedId = selectedContact.id
     try {
-      const res = await fetch(`${API_CONTACTS}/${deletedId}`, {
+      const res = await api(`${API_CONTACTS}/${deletedId}`, {
         method: 'DELETE',
       })
       const data = await res.json().catch(() => ({}))
@@ -630,7 +773,7 @@ function App() {
     setReminderBusyId(reminderId)
     setRemindersError('')
     try {
-      const res = await fetch(`${API_REMINDERS}/${reminderId}`, {
+      const res = await api(`${API_REMINDERS}/${reminderId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ completed: true }),
@@ -660,7 +803,7 @@ function App() {
     setReminderBusyId(reminderId)
     setRemindersError('')
     try {
-      const res = await fetch(`${API_REMINDERS}/${reminderId}`, {
+      const res = await api(`${API_REMINDERS}/${reminderId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ dueDate: tomorrow }),
@@ -692,7 +835,7 @@ function App() {
     setReminderBusyId(reminderId)
     setRemindersError('')
     try {
-      const res = await fetch(`${API_REMINDERS}/${reminderId}`, {
+      const res = await api(`${API_REMINDERS}/${reminderId}`, {
         method: 'DELETE',
       })
       const data = await res.json().catch(() => ({}))
@@ -732,9 +875,39 @@ function App() {
         overdueReminders[0] || todayReminders[0] || upcomingReminders[0]
       setSelectedReminderId(first?.id ?? null)
       if (first) setSelectedId(first.contactId)
+      setSelectedTagKey(null)
+    } else if (id === 'tags') {
+      setSelectedReminderId(null)
+      setSelectedTagKey(null)
     } else {
       setSelectedReminderId(null)
+      setSelectedTagKey(null)
     }
+  }
+
+  function selectTag(tagKey) {
+    setSelectedTagKey(tagKey)
+    setSelectedReminderId(null)
+    setFormMode(null)
+  }
+
+  function clearSelectedTag() {
+    setSelectedTagKey(null)
+  }
+
+  function openContactFromTags(contactId) {
+    selectContact(contactId)
+    // Stay on Tags so the list context remains; detail pane shows the profile.
+  }
+
+  function listTitle() {
+    if (activeNav === 'reminders') return 'Reminders'
+    if (activeNav === 'tags') {
+      if (selectedTag) return selectedTag.label
+      if (selectedTagKey) return selectedTagKey
+      return 'Tags'
+    }
+    return 'People'
   }
 
   function renderReminderGroup(title, items, status) {
@@ -807,13 +980,25 @@ function App() {
           ))}
         </nav>
 
-        <p className="sidebar-hint">Contacts & reminders via API</p>
+        <div className="sidebar-footer">
+          <p className="sidebar-user" title={user.email}>
+            {user.email}
+          </p>
+          <button
+            type="button"
+            className="btn btn-ghost sidebar-logout"
+            onClick={handleLogout}
+            disabled={loggingOut}
+          >
+            {loggingOut ? 'Logging out…' : 'Log out'}
+          </button>
+        </div>
       </aside>
 
       <section className="list-pane" aria-label="Contacts">
         <header className="list-header">
           <div className="list-title-row">
-            <h1>{activeNav === 'reminders' ? 'Reminders' : 'People'}</h1>
+            <h1>{listTitle()}</h1>
             {activeNav === 'people' && (
               <button
                 type="button"
@@ -824,6 +1009,15 @@ function App() {
                 Add person
               </button>
             )}
+            {activeNav === 'tags' && selectedTagKey && (
+              <button
+                type="button"
+                className="btn btn-ghost"
+                onClick={clearSelectedTag}
+              >
+                All tags
+              </button>
+            )}
           </div>
 
           {activeNav === 'reminders' ? (
@@ -831,7 +1025,13 @@ function App() {
               Overdue, today, and upcoming · earliest first
             </p>
           ) : activeNav === 'tags' ? (
-            <p className="list-subtitle">Tags view coming soon</p>
+            <p className="list-subtitle">
+              {selectedTagKey
+                ? selectedTag
+                  ? `${selectedTag.count} contact${selectedTag.count === 1 ? '' : 's'} · click a person to open their profile`
+                  : 'This tag is no longer used on any contact'
+                : 'Tags from your contacts · click one to filter'}
+            </p>
           ) : (
             <label className="search">
               <span className="visually-hidden">Search contacts</span>
@@ -846,21 +1046,81 @@ function App() {
           )}
         </header>
 
-        {activeNav === 'people' && contactsLoading && (
-          <p className="status-banner status-banner--loading">
-            Loading contacts…
-          </p>
-        )}
-        {activeNav === 'people' && contactsError && (
+        {(activeNav === 'people' || activeNav === 'tags') &&
+          contactsLoading && (
+            <p className="status-banner status-banner--loading">
+              Loading contacts…
+            </p>
+          )}
+        {(activeNav === 'people' || activeNav === 'tags') && contactsError && (
           <p className="status-banner status-banner--error" role="alert">
             {contactsError}
           </p>
         )}
 
         {activeNav === 'tags' ? (
-          <ul className="contact-list">
-            <li className="empty">Tag browsing is not built yet.</li>
-          </ul>
+          contactsLoading ? null : (
+            <ul className="contact-list">
+              {contactsError ? (
+                <li className="empty">
+                  Tags unavailable until contacts load from the server.
+                </li>
+              ) : selectedTagKey ? (
+                taggedContacts.length === 0 ? (
+                  <li className="empty">
+                    No contacts currently use “{selectedTag?.label || selectedTagKey}”.
+                  </li>
+                ) : (
+                  taggedContacts.map((contact) => (
+                    <li key={contact.id}>
+                      <button
+                        type="button"
+                        className={
+                          selectedContact &&
+                          sameId(selectedContact.id, contact.id)
+                            ? 'contact-row is-selected'
+                            : 'contact-row'
+                        }
+                        onClick={() => openContactFromTags(contact.id)}
+                      >
+                        <span className="avatar" aria-hidden="true">
+                          {initials(contact.name)}
+                        </span>
+                        <span className="contact-meta">
+                          <span className="contact-name">{contact.name}</span>
+                          <span className="contact-sub">
+                            {contact.company || 'No company'}
+                          </span>
+                        </span>
+                      </button>
+                    </li>
+                  ))
+                )
+              ) : tagStats.length === 0 ? (
+                <li className="empty">
+                  {contacts.length === 0
+                    ? 'No people yet — add someone and give them tags.'
+                    : 'No tags yet — add tags when editing a contact.'}
+                </li>
+              ) : (
+                tagStats.map((tag) => (
+                  <li key={tag.key}>
+                    <button
+                      type="button"
+                      className="contact-row tag-row"
+                      onClick={() => selectTag(tag.key)}
+                    >
+                      <span className="tag tag-row-label">{tag.label}</span>
+                      <span className="tag-row-count">
+                        {tag.count}{' '}
+                        {tag.count === 1 ? 'contact' : 'contacts'}
+                      </span>
+                    </button>
+                  </li>
+                ))
+              )}
+            </ul>
+          )
         ) : activeNav === 'reminders' ? (
           <div className="reminders-board">
             {remindersLoading && (
