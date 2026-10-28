@@ -4,8 +4,10 @@ import './App.css'
 const CONTACTS_KEY = 'peoplesnote-contacts'
 const CONTACTS_BACKUP_KEY = 'peoplesnote-contacts-backup'
 const REMINDERS_KEY = 'peoplesnote-reminders'
+const REMINDERS_BACKUP_KEY = 'peoplesnote-reminders-backup'
 const FOLLOW_UP_OPTIONS = [7, 30, 60]
 const API_CONTACTS = '/api/contacts'
+const API_REMINDERS = '/api/reminders'
 
 /** Compare ids safely (Mongo string ids vs older numeric local ids). */
 function sameId(a, b) {
@@ -122,9 +124,20 @@ function loadBackupContacts() {
   }
 }
 
-function loadReminders() {
+function normalizeReminder(reminder) {
+  return {
+    ...reminder,
+    id: reminder.id ?? reminder._id,
+    contactId: String(reminder.contactId),
+    reason: reminder.reason || '',
+    dueDate: reminder.dueDate || '',
+    completed: Boolean(reminder.completed),
+  }
+}
+
+function readLocalReminders(key) {
   try {
-    const raw = localStorage.getItem(REMINDERS_KEY)
+    const raw = localStorage.getItem(key)
     if (!raw) return []
     const parsed = JSON.parse(raw)
     if (!Array.isArray(parsed)) return []
@@ -139,6 +152,27 @@ function loadReminders() {
   } catch {
     return []
   }
+}
+
+/**
+ * Snapshot existing local reminders once. Never auto-import into Mongo,
+ * and never delete the original key.
+ */
+function ensureRemindersBackup() {
+  try {
+    if (localStorage.getItem(REMINDERS_BACKUP_KEY)) return
+    const raw = localStorage.getItem(REMINDERS_KEY)
+    if (raw) localStorage.setItem(REMINDERS_BACKUP_KEY, raw)
+  } catch {
+    // Ignore quota / private-mode failures.
+  }
+}
+
+function loadBackupReminders() {
+  ensureRemindersBackup()
+  const fromBackup = readLocalReminders(REMINDERS_BACKUP_KEY)
+  if (fromBackup.length > 0) return fromBackup
+  return readLocalReminders(REMINDERS_KEY)
 }
 
 function parseTags(tagsText) {
@@ -172,7 +206,8 @@ function App() {
     ensureContactsBackup()
     return loadBackupContacts()
   })
-  const [reminders, setReminders] = useState(loadReminders)
+  const [reminders, setReminders] = useState([])
+  const [backupReminders] = useState(() => loadBackupReminders())
   const [searchQuery, setSearchQuery] = useState('')
   const [selectedId, setSelectedId] = useState(null)
   const [selectedReminderId, setSelectedReminderId] = useState(null)
@@ -186,13 +221,15 @@ function App() {
   const [savingContact, setSavingContact] = useState(false)
   const [deletingContact, setDeletingContact] = useState(false)
   const [deleteError, setDeleteError] = useState('')
+  const [remindersLoading, setRemindersLoading] = useState(true)
+  const [remindersError, setRemindersError] = useState('')
+  const [reminderSaveError, setReminderSaveError] = useState('')
+  const [savingReminder, setSavingReminder] = useState(false)
+  const [reminderBusyId, setReminderBusyId] = useState(null)
+  const [importingReminders, setImportingReminders] = useState(false)
+  const [importReport, setImportReport] = useState(null)
 
-  // Reminders stay in localStorage; contact links are not rewritten.
-  useEffect(() => {
-    localStorage.setItem(REMINDERS_KEY, JSON.stringify(reminders))
-  }, [reminders])
-
-  // Load contacts from the backend once on mount.
+  // Load contacts + reminders from the backend on mount.
   useEffect(() => {
     let cancelled = false
 
@@ -220,7 +257,31 @@ function App() {
       }
     }
 
+    async function fetchReminders() {
+      setRemindersLoading(true)
+      setRemindersError('')
+      try {
+        const res = await fetch(API_REMINDERS)
+        if (!res.ok) {
+          throw new Error('Could not load reminders from the server.')
+        }
+        const data = await res.json()
+        if (cancelled) return
+        const list = Array.isArray(data) ? data.map(normalizeReminder) : []
+        setReminders(list)
+      } catch (err) {
+        if (cancelled) return
+        setRemindersError(
+          err.message || 'Could not load reminders from the server.',
+        )
+        setReminders([])
+      } finally {
+        if (!cancelled) setRemindersLoading(false)
+      }
+    }
+
     fetchContacts()
+    fetchReminders()
     return () => {
       cancelled = true
     }
@@ -316,6 +377,7 @@ function App() {
       dueDate: todayISO(),
     })
     setFormMode('reminder')
+    setReminderSaveError('')
   }
 
   function cancelForm() {
@@ -323,6 +385,7 @@ function App() {
     setForm(EMPTY_FORM)
     setReminderForm(EMPTY_REMINDER_FORM)
     setSaveError('')
+    setReminderSaveError('')
   }
 
   function handleFormChange(e) {
@@ -422,24 +485,89 @@ function App() {
     }
   }
 
-  function handleReminderSubmit(e) {
+  async function handleReminderSubmit(e) {
     e.preventDefault()
     if (!selectedContact) return
     const reason = reminderForm.reason.trim()
     const dueDate = reminderForm.dueDate
-    if (!reason || !dueDate) return
-
-    // One-shot reminder — completing it later will NOT spawn another.
-    const newReminder = {
-      id: Date.now(),
-      contactId: selectedContact.id,
-      reason,
-      dueDate,
-      completed: false,
+    if (!reason || !dueDate) {
+      setReminderSaveError('Reason and due date are required.')
+      return
     }
-    setReminders((prev) => [...prev, newReminder])
-    setFormMode(null)
-    setReminderForm(EMPTY_REMINDER_FORM)
+
+    setSavingReminder(true)
+    setReminderSaveError('')
+    try {
+      const res = await fetch(API_REMINDERS, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contactId: selectedContact.id,
+          reason,
+          dueDate,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error(data.message || 'Could not save reminder.')
+      }
+      // Only add after the server confirms — completing later won't auto-create another.
+      const saved = normalizeReminder(data)
+      setReminders((prev) => [...prev, saved].sort(sortByDueDate))
+      setFormMode(null)
+      setReminderForm(EMPTY_REMINDER_FORM)
+    } catch (err) {
+      setReminderSaveError(err.message || 'Could not save reminder.')
+    } finally {
+      setSavingReminder(false)
+    }
+  }
+
+  async function importLocalReminders() {
+    if (importingReminders || backupReminders.length === 0) return
+    setImportingReminders(true)
+    setRemindersError('')
+    setImportReport(null)
+    try {
+      const res = await fetch(`${API_REMINDERS}/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          reminders: backupReminders.map((r) => ({
+            localId: r.id,
+            contactId: r.contactId,
+            reason: r.reason,
+            dueDate: r.dueDate,
+            completed: Boolean(r.completed),
+          })),
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error(data.message || 'Could not import reminders.')
+      }
+
+      // Refresh from the server so the UI matches Mongo.
+      const listRes = await fetch(API_REMINDERS)
+      if (listRes.ok) {
+        const list = await listRes.json()
+        setReminders(
+          Array.isArray(list) ? list.map(normalizeReminder) : [],
+        )
+      }
+
+      setImportReport({
+        imported: data.imported ?? 0,
+        skippedDuplicates: data.skippedDuplicates ?? 0,
+        missingContactLinks: Array.isArray(data.missingContactLinks)
+          ? data.missingContactLinks
+          : [],
+      })
+    } catch (err) {
+      setRemindersError(err.message || 'Could not import reminders.')
+    } finally {
+      setImportingReminders(false)
+    }
   }
 
   async function handleDelete() {
@@ -496,26 +624,90 @@ function App() {
     )
   }
 
-  /** Mark done — stays completed; no automatic next reminder. */
-  function completeReminder(reminderId) {
-    setReminders((prev) =>
-      prev.map((r) =>
-        r.id === reminderId ? { ...r, completed: true } : r,
-      ),
-    )
-    if (selectedReminderId === reminderId) {
-      setSelectedReminderId(null)
+  /** Mark done on the server — stays completed; no automatic next reminder. */
+  async function completeReminder(reminderId) {
+    if (reminderBusyId) return
+    setReminderBusyId(reminderId)
+    setRemindersError('')
+    try {
+      const res = await fetch(`${API_REMINDERS}/${reminderId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ completed: true }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error(data.message || 'Could not complete reminder.')
+      }
+      const updated = normalizeReminder(data)
+      setReminders((prev) =>
+        prev.map((r) => (sameId(r.id, updated.id) ? updated : r)),
+      )
+      if (sameId(selectedReminderId, reminderId)) {
+        setSelectedReminderId(null)
+      }
+    } catch (err) {
+      setRemindersError(err.message || 'Could not complete reminder.')
+    } finally {
+      setReminderBusyId(null)
     }
   }
 
-  /** Push due date to tomorrow; reminder stays open. */
-  function snoozeReminder(reminderId) {
+  /** Push due date to tomorrow on the server; reminder stays open. */
+  async function snoozeReminder(reminderId) {
+    if (reminderBusyId) return
     const tomorrow = addDays(todayISO(), 1)
-    setReminders((prev) =>
-      prev.map((r) =>
-        r.id === reminderId ? { ...r, dueDate: tomorrow } : r,
-      ),
+    setReminderBusyId(reminderId)
+    setRemindersError('')
+    try {
+      const res = await fetch(`${API_REMINDERS}/${reminderId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dueDate: tomorrow }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error(data.message || 'Could not snooze reminder.')
+      }
+      const updated = normalizeReminder(data)
+      setReminders((prev) =>
+        prev
+          .map((r) => (sameId(r.id, updated.id) ? updated : r))
+          .sort(sortByDueDate),
+      )
+    } catch (err) {
+      setRemindersError(err.message || 'Could not snooze reminder.')
+    } finally {
+      setReminderBusyId(null)
+    }
+  }
+
+  async function deleteReminder(reminderId) {
+    if (reminderBusyId) return
+    const ok = window.confirm(
+      'Delete this reminder? This cannot be undone.',
     )
+    if (!ok) return
+
+    setReminderBusyId(reminderId)
+    setRemindersError('')
+    try {
+      const res = await fetch(`${API_REMINDERS}/${reminderId}`, {
+        method: 'DELETE',
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error(data.message || 'Could not delete reminder.')
+      }
+      setReminders((prev) => prev.filter((r) => !sameId(r.id, reminderId)))
+      if (sameId(selectedReminderId, reminderId)) {
+        setSelectedReminderId(null)
+      }
+    } catch (err) {
+      setRemindersError(err.message || 'Could not delete reminder.')
+    } finally {
+      setReminderBusyId(null)
+    }
   }
 
   function selectContact(id) {
@@ -615,9 +807,7 @@ function App() {
           ))}
         </nav>
 
-        <p className="sidebar-hint">
-          Contacts via API · reminders in localStorage
-        </p>
+        <p className="sidebar-hint">Contacts & reminders via API</p>
       </aside>
 
       <section className="list-pane" aria-label="Contacts">
@@ -673,20 +863,68 @@ function App() {
           </ul>
         ) : activeNav === 'reminders' ? (
           <div className="reminders-board">
-            {openReminders.length === 0 ? (
+            {remindersLoading && (
+              <p className="status-banner status-banner--loading">
+                Loading reminders…
+              </p>
+            )}
+            {remindersError && (
+              <p className="status-banner status-banner--error" role="alert">
+                {remindersError}
+              </p>
+            )}
+            {backupReminders.length > 0 && (
+              <div className="import-panel">
+                <p className="list-subtitle">
+                  Local backup found ({backupReminders.length}). Import is
+                  optional and won’t create duplicates.
+                </p>
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  onClick={importLocalReminders}
+                  disabled={importingReminders || remindersLoading}
+                >
+                  {importingReminders
+                    ? 'Importing…'
+                    : 'Import local reminders'}
+                </button>
+              </div>
+            )}
+            {importReport && (
+              <div className="import-report" role="status">
+                <p>
+                  Imported {importReport.imported}, skipped{' '}
+                  {importReport.skippedDuplicates} duplicate
+                  {importReport.skippedDuplicates === 1 ? '' : 's'}.
+                </p>
+                {importReport.missingContactLinks.length > 0 && (
+                  <p>
+                    {importReport.missingContactLinks.length} reminder
+                    {importReport.missingContactLinks.length === 1
+                      ? ''
+                      : 's'}{' '}
+                    skipped — linked contact missing in the database.
+                  </p>
+                )}
+              </div>
+            )}
+            {!remindersLoading && openReminders.length === 0 ? (
               <p className="empty">
                 No open reminders. Add one from a contact’s profile.
               </p>
             ) : (
-              <>
-                {renderReminderGroup('Overdue', overdueReminders, 'overdue')}
-                {renderReminderGroup('Today', todayReminders, 'due-today')}
-                {renderReminderGroup(
-                  'Upcoming',
-                  upcomingReminders,
-                  'upcoming',
-                )}
-              </>
+              !remindersLoading && (
+                <>
+                  {renderReminderGroup('Overdue', overdueReminders, 'overdue')}
+                  {renderReminderGroup('Today', todayReminders, 'due-today')}
+                  {renderReminderGroup(
+                    'Upcoming',
+                    upcomingReminders,
+                    'upcoming',
+                  )}
+                </>
+              )
             )}
           </div>
         ) : contactsLoading ? null : (
@@ -755,14 +993,25 @@ function App() {
               />
             </label>
 
+            {reminderSaveError && (
+              <p className="status-banner status-banner--error" role="alert">
+                {reminderSaveError}
+              </p>
+            )}
+
             <div className="form-actions">
-              <button type="submit" className="btn btn-primary">
-                Save reminder
+              <button
+                type="submit"
+                className="btn btn-primary"
+                disabled={savingReminder}
+              >
+                {savingReminder ? 'Saving…' : 'Save reminder'}
               </button>
               <button
                 type="button"
                 className="btn btn-ghost"
                 onClick={cancelForm}
+                disabled={savingReminder}
               >
                 Cancel
               </button>
@@ -911,20 +1160,38 @@ function App() {
               </div>
             </dl>
 
+            {remindersError && (
+              <p className="status-banner status-banner--error" role="alert">
+                {remindersError}
+              </p>
+            )}
+
             <div className="reminder-actions">
               <button
                 type="button"
                 className="btn btn-primary"
                 onClick={() => completeReminder(selectedReminder.id)}
+                disabled={Boolean(reminderBusyId)}
               >
-                Mark complete
+                {sameId(reminderBusyId, selectedReminder.id)
+                  ? 'Working…'
+                  : 'Mark complete'}
               </button>
               <button
                 type="button"
                 className="btn btn-ghost"
                 onClick={() => snoozeReminder(selectedReminder.id)}
+                disabled={Boolean(reminderBusyId)}
               >
                 Snooze until tomorrow
+              </button>
+              <button
+                type="button"
+                className="btn btn-danger"
+                onClick={() => deleteReminder(selectedReminder.id)}
+                disabled={Boolean(reminderBusyId)}
+              >
+                Delete
               </button>
               {selectedReminderContact && (
                 <button
@@ -935,6 +1202,7 @@ function App() {
                     setSelectedId(selectedReminderContact.id)
                     setSelectedReminderId(null)
                   }}
+                  disabled={Boolean(reminderBusyId)}
                 >
                   Open contact
                 </button>
@@ -1056,6 +1324,7 @@ function App() {
                           type="button"
                           className="btn btn-primary"
                           onClick={() => completeReminder(reminder.id)}
+                          disabled={Boolean(reminderBusyId)}
                         >
                           Complete
                         </button>
@@ -1063,6 +1332,7 @@ function App() {
                           type="button"
                           className="btn btn-ghost"
                           onClick={() => snoozeReminder(reminder.id)}
+                          disabled={Boolean(reminderBusyId)}
                         >
                           Snooze
                         </button>
