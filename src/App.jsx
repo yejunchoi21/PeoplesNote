@@ -184,6 +184,8 @@ function App() {
   const [contactsError, setContactsError] = useState('')
   const [saveError, setSaveError] = useState('')
   const [savingContact, setSavingContact] = useState(false)
+  const [deletingContact, setDeletingContact] = useState(false)
+  const [deleteError, setDeleteError] = useState('')
 
   // Reminders stay in localStorage; contact links are not rewritten.
   useEffect(() => {
@@ -303,6 +305,8 @@ function App() {
       followUpDays: String(selectedContact.followUpDays),
     })
     setFormMode('edit')
+    setSaveError('')
+    setDeleteError('')
   }
 
   function openReminderForm() {
@@ -384,15 +388,37 @@ function App() {
       return
     }
 
-    // Edit stays local-only for this milestone (not yet on the API).
     if (formMode === 'edit' && selectedContact) {
-      setContacts((prev) =>
-        prev.map((c) =>
-          sameId(c.id, selectedContact.id) ? { ...c, ...payload } : c,
-        ),
-      )
-      setFormMode(null)
-      setForm(EMPTY_FORM)
+      setSavingContact(true)
+      setSaveError('')
+      try {
+        // Keep lastContacted / reminders untouched — only profile fields change.
+        const res = await fetch(`${API_CONTACTS}/${selectedContact.id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...payload,
+            lastContacted: selectedContact.lastContacted || '',
+          }),
+        })
+        const data = await res.json().catch(() => ({}))
+        if (!res.ok) {
+          throw new Error(data.message || 'Could not update contact.')
+        }
+        const updated = normalizeContact(data)
+        setContacts((prev) =>
+          prev
+            .map((c) => (sameId(c.id, updated.id) ? updated : c))
+            .sort((a, b) => a.name.localeCompare(b.name)),
+        )
+        setSelectedId(updated.id)
+        setFormMode(null)
+        setForm(EMPTY_FORM)
+      } catch (err) {
+        setSaveError(err.message || 'Could not update contact.')
+      } finally {
+        setSavingContact(false)
+      }
     }
   }
 
@@ -416,19 +442,47 @@ function App() {
     setReminderForm(EMPTY_REMINDER_FORM)
   }
 
-  function handleDelete() {
-    if (!selectedContact) return
+  async function handleDelete() {
+    if (!selectedContact || deletingContact) return
+
+    const linkedCount = reminders.filter((r) =>
+      sameId(r.contactId, selectedContact.id),
+    ).length
+    const reminderNote =
+      linkedCount > 0
+        ? ` ${linkedCount} linked reminder${linkedCount === 1 ? '' : 's'} will also be removed.`
+        : ''
     const ok = window.confirm(
-      `Delete ${selectedContact.name}? This only removes them from the current list for now (not yet deleted on the server). Reminders are kept.`,
+      `Delete ${selectedContact.name}? This cannot be undone.${reminderNote}`,
     )
     if (!ok) return
 
-    // Reminders stay intact — contact links are preserved in localStorage.
-    const next = contacts.filter((c) => !sameId(c.id, selectedContact.id))
-    setContacts(next)
-    setSelectedId(next[0]?.id ?? null)
-    setSelectedReminderId(null)
-    setFormMode(null)
+    setDeletingContact(true)
+    setDeleteError('')
+    const deletedId = selectedContact.id
+    try {
+      const res = await fetch(`${API_CONTACTS}/${deletedId}`, {
+        method: 'DELETE',
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error(data.message || 'Could not delete contact.')
+      }
+
+      // Update UI only after the server confirms deletion.
+      const next = contacts.filter((c) => !sameId(c.id, deletedId))
+      setContacts(next)
+      setReminders((prev) =>
+        prev.filter((r) => !sameId(r.contactId, deletedId)),
+      )
+      setSelectedId(next[0]?.id ?? null)
+      setSelectedReminderId(null)
+      setFormMode(null)
+    } catch (err) {
+      setDeleteError(err.message || 'Could not delete contact.')
+    } finally {
+      setDeletingContact(false)
+    }
   }
 
   function handleContactedToday() {
@@ -468,6 +522,8 @@ function App() {
     setSelectedId(id)
     setSelectedReminderId(null)
     setFormMode(null)
+    setDeleteError('')
+    setSaveError('')
   }
 
   function selectReminder(reminder) {
@@ -791,7 +847,7 @@ function App() {
               />
             </label>
 
-            {formMode === 'add' && saveError && (
+            {saveError && (
               <p className="status-banner status-banner--error" role="alert">
                 {saveError}
               </p>
@@ -803,11 +859,11 @@ function App() {
                 className="btn btn-primary"
                 disabled={savingContact}
               >
-                {formMode === 'add'
-                  ? savingContact
-                    ? 'Saving…'
-                    : 'Save person'
-                  : 'Save changes'}
+                {savingContact
+                  ? 'Saving…'
+                  : formMode === 'add'
+                    ? 'Save person'
+                    : 'Save changes'}
               </button>
               <button
                 type="button"
@@ -904,6 +960,7 @@ function App() {
                   type="button"
                   className="btn btn-ghost"
                   onClick={openEditForm}
+                  disabled={deletingContact}
                 >
                   Edit
                 </button>
@@ -911,11 +968,18 @@ function App() {
                   type="button"
                   className="btn btn-danger"
                   onClick={handleDelete}
+                  disabled={deletingContact}
                 >
-                  Delete
+                  {deletingContact ? 'Deleting…' : 'Delete'}
                 </button>
               </div>
             </header>
+
+            {deleteError && (
+              <p className="status-banner status-banner--error" role="alert">
+                {deleteError}
+              </p>
+            )}
 
             <dl className="detail-fields">
               <div>

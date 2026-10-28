@@ -1,6 +1,6 @@
 import 'dotenv/config'
 import express from 'express'
-import { MongoClient } from 'mongodb'
+import { MongoClient, ObjectId } from 'mongodb'
 
 const PORT = Number(process.env.PORT) || 3001
 const HOST = process.env.HOST || '127.0.0.1'
@@ -27,6 +27,12 @@ function serializeContact(doc) {
     id: String(_id),
     ...rest,
   }
+}
+
+/** Returns an ObjectId or null when the id is missing/invalid. */
+function parseContactId(id) {
+  if (typeof id !== 'string' || !ObjectId.isValid(id)) return null
+  return new ObjectId(id)
 }
 
 function normalizeIncomingContact(body = {}) {
@@ -110,6 +116,86 @@ app.post('/api/contacts', async (req, res) => {
     res.status(500).json({
       ok: false,
       message: 'Failed to create contact',
+    })
+  }
+})
+
+app.put('/api/contacts/:id', async (req, res) => {
+  try {
+    const objectId = parseContactId(req.params.id)
+    if (!objectId) {
+      return res.status(400).json({
+        ok: false,
+        message: 'Invalid contact id',
+      })
+    }
+
+    const contact = normalizeIncomingContact(req.body)
+    if (!contact.name) {
+      return res.status(400).json({
+        ok: false,
+        message: 'Name is required',
+      })
+    }
+
+    const result = await contactsCollection().findOneAndUpdate(
+      { _id: objectId },
+      {
+        $set: {
+          ...contact,
+          updatedAt: new Date(),
+        },
+      },
+      { returnDocument: 'after' },
+    )
+
+    // Driver returns the document directly (or null if not found).
+    const updated = result?.value ?? result
+    if (!updated || !updated._id) {
+      return res.status(404).json({
+        ok: false,
+        message: 'Contact not found',
+      })
+    }
+
+    res.json(serializeContact(updated))
+  } catch (err) {
+    console.error('PUT /api/contacts/:id failed:', err.message)
+    res.status(500).json({
+      ok: false,
+      message: 'Failed to update contact',
+    })
+  }
+})
+
+app.delete('/api/contacts/:id', async (req, res) => {
+  try {
+    const objectId = parseContactId(req.params.id)
+    if (!objectId) {
+      return res.status(400).json({
+        ok: false,
+        message: 'Invalid contact id',
+      })
+    }
+
+    const result = await contactsCollection().deleteOne({ _id: objectId })
+    if (result.deletedCount === 0) {
+      return res.status(404).json({
+        ok: false,
+        message: 'Contact not found',
+      })
+    }
+
+    res.json({
+      ok: true,
+      message: 'Contact deleted',
+      id: req.params.id,
+    })
+  } catch (err) {
+    console.error('DELETE /api/contacts/:id failed:', err.message)
+    res.status(500).json({
+      ok: false,
+      message: 'Failed to delete contact',
     })
   }
 })
