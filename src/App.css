@@ -135,6 +135,30 @@
   color: var(--muted);
 }
 
+.status-banner {
+  margin: 0.5rem 1rem 0;
+  padding: 0.55rem 0.75rem;
+  border-radius: 8px;
+  font-size: 0.85rem;
+}
+
+.status-banner--loading {
+  background: var(--hover);
+  color: var(--muted);
+}
+
+.status-banner--error {
+  background: rgba(184, 59, 59, 0.1);
+  color: #b83b3b;
+}
+
+@media (prefers-color-scheme: dark) {
+  .status-banner--error {
+    background: rgba(240, 160, 160, 0.12);
+    color: #f0a0a0;
+  }
+}
+
 /* Shared buttons */
 .btn {
   appearance: none;

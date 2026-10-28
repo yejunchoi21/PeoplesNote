@@ -2,70 +2,15 @@ import { useEffect, useState } from 'react'
 import './App.css'
 
 const CONTACTS_KEY = 'peoplesnote-contacts'
+const CONTACTS_BACKUP_KEY = 'peoplesnote-contacts-backup'
 const REMINDERS_KEY = 'peoplesnote-reminders'
 const FOLLOW_UP_OPTIONS = [7, 30, 60]
+const API_CONTACTS = '/api/contacts'
 
-/**
- * Seed contacts only when localStorage has none yet.
- * Existing saved contacts are never overwritten by this list.
- */
-const SAMPLE_CONTACTS = [
-  {
-    id: 1,
-    name: 'Maya Chen',
-    email: 'maya.chen@example.com',
-    phone: '(555) 214-8801',
-    company: 'Northwind Labs',
-    tags: ['work', 'mentor'],
-    notes: 'Met at React meetup. Prefers async updates.',
-    lastContacted: '2026-10-12',
-    followUpDays: 30,
-  },
-  {
-    id: 2,
-    name: 'Jordan Blake',
-    email: 'jordan.blake@example.com',
-    phone: '(555) 903-4412',
-    company: 'Freelance',
-    tags: ['friend'],
-    notes: 'Coffee next time they are in town.',
-    lastContacted: '2026-09-28',
-    followUpDays: 60,
-  },
-  {
-    id: 3,
-    name: 'Sam Ortiz',
-    email: 'sam.ortiz@example.com',
-    phone: '(555) 677-0199',
-    company: 'Bright Harbor',
-    tags: ['client', 'follow-up'],
-    notes: 'Sent proposal draft. Waiting on feedback.',
-    lastContacted: '2026-10-20',
-    followUpDays: 7,
-  },
-  {
-    id: 4,
-    name: 'Priya Nair',
-    email: 'priya.nair@example.com',
-    phone: '(555) 330-7620',
-    company: 'Civic Studio',
-    tags: ['work'],
-    notes: 'Introduced me to the design team.',
-    lastContacted: '2026-08-15',
-    followUpDays: 30,
-  },
-  {
-    id: 5,
-    name: 'Alex Rivera',
-    email: 'alex.rivera@example.com',
-    phone: '(555) 118-5543',
-    company: 'Independent',
-    tags: ['friend', 'college'],
-    notes: 'Birthday in November. Loves hiking.',
-    lastContacted: '',
-    followUpDays: 60,
-  },
-]
+/** Compare ids safely (Mongo string ids vs older numeric local ids). */
+function sameId(a, b) {
+  return String(a) === String(b)
+}
 
 const NAV_ITEMS = [
   { id: 'people', label: 'People' },
@@ -142,25 +87,41 @@ function normalizeContact(contact) {
     : 30
   return {
     ...contact,
+    id: contact.id ?? contact._id,
     lastContacted: contact.lastContacted || '',
     tags: Array.isArray(contact.tags) ? contact.tags : [],
     followUpDays,
   }
 }
 
-function loadContacts() {
+/**
+ * Snapshot existing local contacts once. Never auto-import into Mongo,
+ * and never delete the original key.
+ */
+function ensureContactsBackup() {
   try {
+    if (localStorage.getItem(CONTACTS_BACKUP_KEY)) return
     const raw = localStorage.getItem(CONTACTS_KEY)
-    if (!raw) return SAMPLE_CONTACTS.map(normalizeContact)
-    const parsed = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return SAMPLE_CONTACTS.map(normalizeContact)
-    return parsed.map(normalizeContact)
+    if (raw) localStorage.setItem(CONTACTS_BACKUP_KEY, raw)
   } catch {
-    return SAMPLE_CONTACTS.map(normalizeContact)
+    // Ignore quota / private-mode failures — API is source of truth now.
   }
 }
 
-/** Separate key so existing contact data is never wiped. */
+/** Read-only local contacts for reminder name lookup (not shown in People). */
+function loadBackupContacts() {
+  try {
+    const raw =
+      localStorage.getItem(CONTACTS_BACKUP_KEY) ||
+      localStorage.getItem(CONTACTS_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed.map(normalizeContact) : []
+  } catch {
+    return []
+  }
+}
+
 function loadReminders() {
   try {
     const raw = localStorage.getItem(REMINDERS_KEY)
@@ -205,27 +166,63 @@ function sortByDueDate(a, b) {
 }
 
 function App() {
-  const [contacts, setContacts] = useState(loadContacts)
+  // People list comes from Mongo via the API (starts empty until fetch).
+  const [contacts, setContacts] = useState([])
+  const [backupContacts] = useState(() => {
+    ensureContactsBackup()
+    return loadBackupContacts()
+  })
   const [reminders, setReminders] = useState(loadReminders)
   const [searchQuery, setSearchQuery] = useState('')
-  const [selectedId, setSelectedId] = useState(
-    () => loadContacts()[0]?.id ?? null,
-  )
+  const [selectedId, setSelectedId] = useState(null)
   const [selectedReminderId, setSelectedReminderId] = useState(null)
   const [activeNav, setActiveNav] = useState('people')
   const [formMode, setFormMode] = useState(null)
   const [form, setForm] = useState(EMPTY_FORM)
   const [reminderForm, setReminderForm] = useState(EMPTY_REMINDER_FORM)
+  const [contactsLoading, setContactsLoading] = useState(true)
+  const [contactsError, setContactsError] = useState('')
+  const [saveError, setSaveError] = useState('')
+  const [savingContact, setSavingContact] = useState(false)
 
-  // Contacts stay on their original key — preserves existing people.
-  useEffect(() => {
-    localStorage.setItem(CONTACTS_KEY, JSON.stringify(contacts))
-  }, [contacts])
-
-  // Reminders live on a separate key.
+  // Reminders stay in localStorage; contact links are not rewritten.
   useEffect(() => {
     localStorage.setItem(REMINDERS_KEY, JSON.stringify(reminders))
   }, [reminders])
+
+  // Load contacts from the backend once on mount.
+  useEffect(() => {
+    let cancelled = false
+
+    async function fetchContacts() {
+      setContactsLoading(true)
+      setContactsError('')
+      try {
+        const res = await fetch(API_CONTACTS)
+        if (!res.ok) {
+          throw new Error('Could not load contacts from the server.')
+        }
+        const data = await res.json()
+        if (cancelled) return
+        const list = Array.isArray(data) ? data.map(normalizeContact) : []
+        setContacts(list)
+        setSelectedId((current) => current ?? list[0]?.id ?? null)
+      } catch (err) {
+        if (cancelled) return
+        setContactsError(
+          err.message || 'Could not load contacts from the server.',
+        )
+        setContacts([])
+      } finally {
+        if (!cancelled) setContactsLoading(false)
+      }
+    }
+
+    fetchContacts()
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   const filteredContacts = contacts.filter((contact) => {
     const q = searchQuery.toLowerCase().trim()
@@ -255,17 +252,19 @@ function App() {
   const needsAttentionCount = overdueReminders.length + todayReminders.length
 
   const selectedContact =
-    contacts.find((c) => c.id === selectedId) || null
+    contacts.find((c) => sameId(c.id, selectedId)) || null
 
   const selectedReminder =
-    openReminders.find((r) => r.id === selectedReminderId) || null
+    openReminders.find((r) => sameId(r.id, selectedReminderId)) || null
 
   const selectedReminderContact = selectedReminder
-    ? contacts.find((c) => c.id === selectedReminder.contactId) || null
+    ? contacts.find((c) => sameId(c.id, selectedReminder.contactId)) ||
+      backupContacts.find((c) => sameId(c.id, selectedReminder.contactId)) ||
+      null
     : null
 
   const contactOpenReminders = selectedContact
-    ? openReminders.filter((r) => r.contactId === selectedContact.id)
+    ? openReminders.filter((r) => sameId(r.contactId, selectedContact.id))
     : []
 
   const selectedDue = selectedContact
@@ -275,8 +274,13 @@ function App() {
       }
     : null
 
+  /** Resolve names from API contacts first, then local backup (for old reminders). */
   function contactName(contactId) {
-    return contacts.find((c) => c.id === contactId)?.name || 'Unknown person'
+    const fromApi = contacts.find((c) => sameId(c.id, contactId))
+    if (fromApi) return fromApi.name
+    const fromBackup = backupContacts.find((c) => sameId(c.id, contactId))
+    if (fromBackup) return fromBackup.name
+    return 'Unknown person'
   }
 
   function openAddForm() {
@@ -284,6 +288,7 @@ function App() {
     setForm(EMPTY_FORM)
     setFormMode('add')
     setSelectedReminderId(null)
+    setSaveError('')
   }
 
   function openEditForm() {
@@ -313,6 +318,7 @@ function App() {
     setFormMode(null)
     setForm(EMPTY_FORM)
     setReminderForm(EMPTY_REMINDER_FORM)
+    setSaveError('')
   }
 
   function handleFormChange(e) {
@@ -325,10 +331,13 @@ function App() {
     setReminderForm((prev) => ({ ...prev, [name]: value }))
   }
 
-  function handleFormSubmit(e) {
+  async function handleFormSubmit(e) {
     e.preventDefault()
     const name = form.name.trim()
-    if (!name) return
+    if (!name) {
+      setSaveError('Name is required.')
+      return
+    }
 
     const followUpDays = Number(form.followUpDays)
     const payload = {
@@ -344,23 +353,47 @@ function App() {
     }
 
     if (formMode === 'add') {
-      const newContact = {
-        ...payload,
-        id: Date.now(),
-        lastContacted: todayISO(),
+      setSavingContact(true)
+      setSaveError('')
+      try {
+        const res = await fetch(API_CONTACTS, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...payload,
+            lastContacted: todayISO(),
+          }),
+        })
+        const data = await res.json().catch(() => ({}))
+        if (!res.ok) {
+          throw new Error(data.message || 'Could not save contact.')
+        }
+        // Only add to the list after the server confirms the save.
+        const saved = normalizeContact(data)
+        setContacts((prev) =>
+          [...prev, saved].sort((a, b) => a.name.localeCompare(b.name)),
+        )
+        setSelectedId(saved.id)
+        setFormMode(null)
+        setForm(EMPTY_FORM)
+      } catch (err) {
+        setSaveError(err.message || 'Could not save contact.')
+      } finally {
+        setSavingContact(false)
       }
-      setContacts((prev) => [...prev, newContact])
-      setSelectedId(newContact.id)
-    } else if (formMode === 'edit' && selectedContact) {
-      setContacts((prev) =>
-        prev.map((c) =>
-          c.id === selectedContact.id ? { ...c, ...payload } : c,
-        ),
-      )
+      return
     }
 
-    setFormMode(null)
-    setForm(EMPTY_FORM)
+    // Edit stays local-only for this milestone (not yet on the API).
+    if (formMode === 'edit' && selectedContact) {
+      setContacts((prev) =>
+        prev.map((c) =>
+          sameId(c.id, selectedContact.id) ? { ...c, ...payload } : c,
+        ),
+      )
+      setFormMode(null)
+      setForm(EMPTY_FORM)
+    }
   }
 
   function handleReminderSubmit(e) {
@@ -386,16 +419,13 @@ function App() {
   function handleDelete() {
     if (!selectedContact) return
     const ok = window.confirm(
-      `Delete ${selectedContact.name}? This cannot be undone.`,
+      `Delete ${selectedContact.name}? This only removes them from the current list for now (not yet deleted on the server). Reminders are kept.`,
     )
     if (!ok) return
 
-    const next = contacts.filter((c) => c.id !== selectedContact.id)
+    // Reminders stay intact — contact links are preserved in localStorage.
+    const next = contacts.filter((c) => !sameId(c.id, selectedContact.id))
     setContacts(next)
-    // Drop reminders tied to the deleted person.
-    setReminders((prev) =>
-      prev.filter((r) => r.contactId !== selectedContact.id),
-    )
     setSelectedId(next[0]?.id ?? null)
     setSelectedReminderId(null)
     setFormMode(null)
@@ -405,7 +435,7 @@ function App() {
     if (!selectedContact) return
     setContacts((prev) =>
       prev.map((c) =>
-        c.id === selectedContact.id
+        sameId(c.id, selectedContact.id)
           ? { ...c, lastContacted: todayISO() }
           : c,
       ),
@@ -529,7 +559,9 @@ function App() {
           ))}
         </nav>
 
-        <p className="sidebar-hint">Saved in this browser (localStorage)</p>
+        <p className="sidebar-hint">
+          Contacts via API · reminders in localStorage
+        </p>
       </aside>
 
       <section className="list-pane" aria-label="Contacts">
@@ -541,6 +573,7 @@ function App() {
                 type="button"
                 className="btn btn-primary"
                 onClick={openAddForm}
+                disabled={contactsLoading}
               >
                 Add person
               </button>
@@ -561,10 +594,22 @@ function App() {
                 placeholder="Search name, company, or tag…"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
+                disabled={contactsLoading}
               />
             </label>
           )}
         </header>
+
+        {activeNav === 'people' && contactsLoading && (
+          <p className="status-banner status-banner--loading">
+            Loading contacts…
+          </p>
+        )}
+        {activeNav === 'people' && contactsError && (
+          <p className="status-banner status-banner--error" role="alert">
+            {contactsError}
+          </p>
+        )}
 
         {activeNav === 'tags' ? (
           <ul className="contact-list">
@@ -588,13 +633,15 @@ function App() {
               </>
             )}
           </div>
-        ) : (
+        ) : contactsLoading ? null : (
           <ul className="contact-list">
             {filteredContacts.length === 0 ? (
               <li className="empty">
-                {contacts.length === 0
-                  ? 'No people yet — add someone.'
-                  : `No contacts match “${searchQuery}”`}
+                {contactsError
+                  ? 'Contacts unavailable until the server responds.'
+                  : contacts.length === 0
+                    ? 'No people yet — add someone.'
+                    : `No contacts match “${searchQuery}”`}
               </li>
             ) : (
               filteredContacts.map((contact) => (
@@ -602,7 +649,7 @@ function App() {
                   <button
                     type="button"
                     className={
-                      selectedContact?.id === contact.id
+                      selectedContact && sameId(selectedContact.id, contact.id)
                         ? 'contact-row is-selected'
                         : 'contact-row'
                     }
@@ -744,14 +791,29 @@ function App() {
               />
             </label>
 
+            {formMode === 'add' && saveError && (
+              <p className="status-banner status-banner--error" role="alert">
+                {saveError}
+              </p>
+            )}
+
             <div className="form-actions">
-              <button type="submit" className="btn btn-primary">
-                {formMode === 'add' ? 'Save person' : 'Save changes'}
+              <button
+                type="submit"
+                className="btn btn-primary"
+                disabled={savingContact}
+              >
+                {formMode === 'add'
+                  ? savingContact
+                    ? 'Saving…'
+                    : 'Save person'
+                  : 'Save changes'}
               </button>
               <button
                 type="button"
                 className="btn btn-ghost"
                 onClick={cancelForm}
+                disabled={savingContact}
               >
                 Cancel
               </button>
