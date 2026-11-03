@@ -3,9 +3,11 @@ import crypto from 'crypto'
 import bcrypt from 'bcrypt'
 import MongoStore from 'connect-mongo'
 import express from 'express'
-import rateLimit from 'express-rate-limit'
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit'
 import session from 'express-session'
 import { MongoClient, ObjectId } from 'mongodb'
+import { Resend } from 'resend'
+import { normalizeNotificationFields } from './notificationFields.js'
 
 const PORT = Number(process.env.PORT) || 3001
 const HOST = process.env.HOST || '127.0.0.1'
@@ -14,6 +16,8 @@ const SESSION_SECRET = process.env.SESSION_SECRET
 const NODE_ENV = process.env.NODE_ENV || 'development'
 const IS_PROD = NODE_ENV === 'production'
 const BCRYPT_ROUNDS = Number(process.env.BCRYPT_ROUNDS) || 12
+const RESEND_API_KEY = process.env.RESEND_API_KEY || ''
+const EMAIL_FROM = process.env.EMAIL_FROM || ''
 
 if (!MONGODB_URI) {
   console.error('Missing MONGODB_URI. Copy .env.example to .env and set it.')
@@ -76,6 +80,12 @@ function serializeReminder(doc) {
   return {
     id: String(_id),
     ...rest,
+    // Older reminders may lack notify fields — expose stable defaults.
+    emailNotifyEnabled: Boolean(rest.emailNotifyEnabled),
+    notifyAtUtc: rest.notifyAtUtc ?? null,
+    notifyTimeZone: rest.notifyTimeZone ?? null,
+    notifyLocalDate: rest.notifyLocalDate ?? null,
+    notifyLocalTime: rest.notifyLocalTime ?? null,
   }
 }
 
@@ -108,12 +118,22 @@ function normalizeIncomingReminder(body = {}) {
       ? ''
       : String(body.contactId).trim()
 
+  const notify = normalizeNotificationFields(body)
+  if (!notify.ok) {
+    return { error: notify.message }
+  }
+
   return {
     contactId,
     reason,
     dueDate,
     completed: Boolean(body.completed),
+    ...notify.value,
   }
+}
+
+function emailConfigured() {
+  return Boolean(RESEND_API_KEY.trim() && EMAIL_FROM.trim())
 }
 
 function sessionUserId(req) {
@@ -164,6 +184,21 @@ const loginLimiter = rateLimit({
   message: {
     ok: false,
     message: 'Too many login attempts. Try again later.',
+  },
+})
+
+const testEmailLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    if (req.session?.userId) return `user:${req.session.userId}`
+    return ipKeyGenerator(req.ip)
+  },
+  message: {
+    ok: false,
+    message: 'Too many test emails. Try again later.',
   },
 })
 
@@ -381,6 +416,69 @@ async function start() {
   // —— Protected data routes ——
   app.use('/api/contacts', requireAuth, requireCsrf)
   app.use('/api/reminders', requireAuth, requireCsrf)
+  app.use('/api/notifications', requireAuth, requireCsrf)
+
+  /**
+   * Manual test email — only to the signed-in user's account email.
+   * Does not schedule reminder emails; acceptance = provider submitted.
+   */
+  app.post(
+    '/api/notifications/test-email',
+    testEmailLimiter,
+    async (req, res) => {
+      try {
+        if (!emailConfigured()) {
+          return res.status(503).json({
+            ok: false,
+            message:
+              'Email is not configured. Set RESEND_API_KEY and EMAIL_FROM in the server .env file.',
+          })
+        }
+
+        const userId = sessionUserId(req)
+        const user = await usersCollection().findOne({ _id: userId })
+        if (!user?.email) {
+          return res.status(401).json({
+            ok: false,
+            message: 'Authentication required',
+          })
+        }
+
+        const resend = new Resend(RESEND_API_KEY)
+        const { data, error } = await resend.emails.send({
+          from: EMAIL_FROM,
+          to: user.email,
+          subject: 'PeoplesNote test email',
+          text: `This is a test email from PeoplesNote for ${user.email}. If you received this, outbound email is working. Reminder emails are not sent automatically yet.`,
+        })
+
+        if (error) {
+          console.error('Test email provider error:', error.message || error)
+          return res.status(502).json({
+            ok: false,
+            message:
+              error.message ||
+              'Email provider rejected the request. Check sender verification and API key.',
+          })
+        }
+
+        res.json({
+          ok: true,
+          status: 'submitted',
+          message:
+            'Test email submitted to the provider. Inbox delivery is not confirmed.',
+          id: data?.id || null,
+          to: user.email,
+        })
+      } catch (err) {
+        console.error('POST /api/notifications/test-email failed:', err.message)
+        res.status(500).json({
+          ok: false,
+          message: 'Failed to submit test email',
+        })
+      }
+    },
+  )
 
   app.get('/api/contacts', async (req, res) => {
     try {
@@ -545,6 +643,12 @@ async function start() {
       const userId = sessionUserId(req)
       const reminder = normalizeIncomingReminder(req.body)
 
+      if (reminder.error) {
+        return res.status(400).json({
+          ok: false,
+          message: reminder.error,
+        })
+      }
       if (!reminder.reason) {
         return res.status(400).json({
           ok: false,
@@ -613,14 +717,18 @@ async function start() {
             : raw?.id !== undefined && raw?.id !== null
               ? String(raw.id)
               : ''
-        const reminder = normalizeIncomingReminder(raw)
+        const reminder = normalizeIncomingReminder({
+          ...raw,
+          // Imports never enable email notify automatically.
+          emailNotifyEnabled: false,
+        })
 
-        if (!reminder.reason || !reminder.dueDate) {
+        if (reminder.error || !reminder.reason || !reminder.dueDate) {
           missingContactLinks.push({
             localId,
-            contactId: reminder.contactId,
-            reason: reminder.reason,
-            dueDate: reminder.dueDate,
+            contactId: reminder.contactId || String(raw?.contactId || ''),
+            reason: reminder.reason || '',
+            dueDate: reminder.dueDate || '',
             issue: 'invalid_reminder',
           })
           continue
@@ -669,6 +777,11 @@ async function start() {
           reason: reminder.reason,
           dueDate: reminder.dueDate,
           completed: Boolean(raw.completed),
+          emailNotifyEnabled: false,
+          notifyAtUtc: null,
+          notifyTimeZone: null,
+          notifyLocalDate: null,
+          notifyLocalTime: null,
           importedLocalId: localId || undefined,
           createdAt: new Date(),
           importedAt: new Date(),
