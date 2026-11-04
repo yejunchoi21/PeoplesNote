@@ -1,5 +1,8 @@
 import 'dotenv/config'
 import crypto from 'crypto'
+import fs from 'fs'
+import path from 'path'
+import { fileURLToPath } from 'url'
 import bcrypt from 'bcrypt'
 import MongoStore from 'connect-mongo'
 import express from 'express'
@@ -13,15 +16,37 @@ import {
   startReminderEmailLoop,
 } from './reminderEmailScheduler.js'
 
-const PORT = Number(process.env.PORT) || 3001
-const HOST = process.env.HOST || '127.0.0.1'
-const MONGODB_URI = process.env.MONGODB_URI
-const SESSION_SECRET = process.env.SESSION_SECRET
 const NODE_ENV = process.env.NODE_ENV || 'development'
 const IS_PROD = NODE_ENV === 'production'
+// Hosting platforms inject PORT. Bind all interfaces in production unless HOST is set.
+const PORT = Number(process.env.PORT) || 3001
+const HOST = process.env.HOST || (IS_PROD ? '0.0.0.0' : '127.0.0.1')
+const MONGODB_URI = process.env.MONGODB_URI
+const SESSION_SECRET = process.env.SESSION_SECRET
 const BCRYPT_ROUNDS = Number(process.env.BCRYPT_ROUNDS) || 12
 const RESEND_API_KEY = process.env.RESEND_API_KEY || ''
 const EMAIL_FROM = process.env.EMAIL_FROM || ''
+// How many reverse proxies sit in front (needed for secure cookies + correct IPs).
+const TRUST_PROXY = process.env.TRUST_PROXY
+  ? Number(process.env.TRUST_PROXY)
+  : IS_PROD
+    ? 1
+    : 1
+const COOKIE_SECURE =
+  process.env.COOKIE_SECURE === 'true'
+    ? true
+    : process.env.COOKIE_SECURE === 'false'
+      ? false
+      : IS_PROD
+const SERVE_FRONTEND =
+  process.env.SERVE_FRONTEND === 'true'
+    ? true
+    : process.env.SERVE_FRONTEND === 'false'
+      ? false
+      : IS_PROD
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const DIST_DIR = path.resolve(__dirname, '..', 'dist')
 
 if (!MONGODB_URI) {
   console.error('Missing MONGODB_URI. Copy .env.example to .env and set it.')
@@ -35,7 +60,7 @@ if (!SESSION_SECRET || SESSION_SECRET.length < 16) {
 const app = express()
 const client = new MongoClient(MONGODB_URI)
 
-app.set('trust proxy', 1)
+app.set('trust proxy', Number.isFinite(TRUST_PROXY) ? TRUST_PROXY : 1)
 app.use(express.json({ limit: '100kb' }))
 
 function db() {
@@ -289,6 +314,8 @@ async function start() {
       secret: SESSION_SECRET,
       resave: false,
       saveUninitialized: false,
+      // Trust X-Forwarded-Proto when behind a reverse proxy (HTTPS terminators).
+      proxy: COOKIE_SECURE,
       store: MongoStore.create({
         client,
         collectionName: 'sessions',
@@ -296,7 +323,7 @@ async function start() {
       }),
       cookie: {
         httpOnly: true,
-        secure: IS_PROD,
+        secure: COOKIE_SECURE,
         sameSite: 'lax',
         maxAge: 1000 * 60 * 60 * 24 * 14,
       },
@@ -1114,8 +1141,25 @@ async function start() {
     }
   })
 
+  // Production (or SERVE_FRONTEND=true): same origin for UI + /api.
+  if (SERVE_FRONTEND) {
+    if (fs.existsSync(DIST_DIR)) {
+      app.use(express.static(DIST_DIR, { index: false }))
+      app.get(/^(?!\/api(?:\/|$)).*/, (_req, res) => {
+        res.sendFile(path.join(DIST_DIR, 'index.html'))
+      })
+      console.log(`Serving frontend from ${DIST_DIR}`)
+    } else {
+      console.warn(
+        `SERVE_FRONTEND is on but ${DIST_DIR} is missing. Run "npm run build" from the repo root, then restart.`,
+      )
+    }
+  }
+
   app.listen(PORT, HOST, () => {
-    console.log(`PeoplesNote API listening on http://${HOST}:${PORT}`)
+    console.log(
+      `PeoplesNote listening on http://${HOST}:${PORT} (${NODE_ENV})`,
+    )
     if (emailConfigured()) {
       startReminderEmailLoop({
         remindersCollection: remindersCollection(),
@@ -1125,7 +1169,7 @@ async function start() {
         isConfigured: emailConfigured,
       })
       console.log(
-        'Reminder email scheduler started (1-minute loop; submitted ≠ delivered)',
+        'Reminder email scheduler started (1-minute loop; submitted ≠ delivered). Keep this process running.',
       )
     } else {
       console.log(
