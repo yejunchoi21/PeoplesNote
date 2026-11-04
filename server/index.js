@@ -8,6 +8,10 @@ import session from 'express-session'
 import { MongoClient, ObjectId } from 'mongodb'
 import { Resend } from 'resend'
 import { normalizeNotificationFields } from './notificationFields.js'
+import {
+  applyNotifyScheduleChange,
+  startReminderEmailLoop,
+} from './reminderEmailScheduler.js'
 
 const PORT = Number(process.env.PORT) || 3001
 const HOST = process.env.HOST || '127.0.0.1'
@@ -86,7 +90,26 @@ function serializeReminder(doc) {
     notifyTimeZone: rest.notifyTimeZone ?? null,
     notifyLocalDate: rest.notifyLocalDate ?? null,
     notifyLocalTime: rest.notifyLocalTime ?? null,
+    notifyStatus: rest.notifyStatus ?? null,
+    notifyStatusUpdatedAt: rest.notifyStatusUpdatedAt ?? null,
+    notifySubmittedAt: rest.notifySubmittedAt ?? null,
+    notifyFailedAt: rest.notifyFailedAt ?? null,
+    notifyError: rest.notifyError ?? null,
+    notifyProviderId: rest.notifyProviderId ?? null,
   }
+}
+
+async function sendViaResend({ from, to, subject, text, idempotencyKey }) {
+  const resend = new Resend(RESEND_API_KEY)
+  const options = idempotencyKey ? { idempotencyKey } : undefined
+  const { data, error } = await resend.emails.send(
+    { from, to, subject, text },
+    options,
+  )
+  if (error) {
+    return { ok: false, error: error.message || 'Email provider rejected the request' }
+  }
+  return { ok: true, id: data?.id || null }
 }
 
 function normalizeIncomingContact(body = {}) {
@@ -218,6 +241,15 @@ async function ensureIndexes() {
   await remindersCollection().createIndex(
     { userId: 1, contactId: 1 },
     { name: 'reminders_user_contact' },
+  )
+  await remindersCollection().createIndex(
+    {
+      emailNotifyEnabled: 1,
+      notifyStatus: 1,
+      completed: 1,
+      notifyAtUtc: 1,
+    },
+    { name: 'reminders_due_email_notify' },
   )
 }
 
@@ -676,20 +708,27 @@ async function start() {
         })
       }
 
+      const now = new Date()
+      const schedule = applyNotifyScheduleChange(reminder, null, now)
       const doc = {
         ...reminder,
+        ...schedule,
         userId,
         completed: false,
-        createdAt: new Date(),
+        createdAt: now,
       }
 
       const result = await remindersCollection().insertOne(doc)
-      res.status(201).json(
-        serializeReminder({
-          _id: result.insertedId,
-          ...doc,
-        }),
-      )
+      let saved = { _id: result.insertedId, ...doc }
+      if (saved.emailNotifyEnabled && saved.notifyAtUtc) {
+        const withKey = applyNotifyScheduleChange(saved, result.insertedId, now)
+        await remindersCollection().updateOne(
+          { _id: result.insertedId },
+          { $set: withKey },
+        )
+        saved = { ...saved, ...withKey }
+      }
+      res.status(201).json(serializeReminder(saved))
     } catch (err) {
       console.error('POST /api/reminders failed:', err.message)
       res.status(500).json({
@@ -771,20 +810,28 @@ async function start() {
           continue
         }
 
+        const now = new Date()
+        const schedule = applyNotifyScheduleChange(
+          {
+            emailNotifyEnabled: false,
+            notifyAtUtc: null,
+            notifyTimeZone: null,
+            notifyLocalDate: null,
+            notifyLocalTime: null,
+          },
+          null,
+          now,
+        )
         const doc = {
           userId,
           contactId: reminder.contactId,
           reason: reminder.reason,
           dueDate: reminder.dueDate,
           completed: Boolean(raw.completed),
-          emailNotifyEnabled: false,
-          notifyAtUtc: null,
-          notifyTimeZone: null,
-          notifyLocalDate: null,
-          notifyLocalTime: null,
+          ...schedule,
           importedLocalId: localId || undefined,
-          createdAt: new Date(),
-          importedAt: new Date(),
+          createdAt: now,
+          importedAt: now,
         }
 
         const result = await remindersCollection().insertOne(doc)
@@ -820,7 +867,20 @@ async function start() {
         })
       }
 
+      const existing = await remindersCollection().findOne({
+        _id: objectId,
+        userId,
+      })
+      if (!existing) {
+        return res.status(404).json({
+          ok: false,
+          message: 'Reminder not found',
+        })
+      }
+
       const updates = {}
+      const now = new Date()
+
       if (typeof req.body?.reason === 'string') {
         const reason = req.body.reason.trim()
         if (!reason) {
@@ -845,6 +905,38 @@ async function start() {
         updates.completed = req.body.completed
       }
 
+      const notifyTouched =
+        Object.prototype.hasOwnProperty.call(req.body || {}, 'emailNotifyEnabled') ||
+        Object.prototype.hasOwnProperty.call(req.body || {}, 'notifyLocalDate') ||
+        Object.prototype.hasOwnProperty.call(req.body || {}, 'notifyLocalTime') ||
+        Object.prototype.hasOwnProperty.call(req.body || {}, 'notifyTimeZone') ||
+        Object.prototype.hasOwnProperty.call(req.body || {}, 'notifyAtUtc')
+
+      if (notifyTouched) {
+        const notify = normalizeNotificationFields(req.body)
+        if (!notify.ok) {
+          return res.status(400).json({
+            ok: false,
+            message: notify.message,
+          })
+        }
+        Object.assign(
+          updates,
+          applyNotifyScheduleChange(notify.value, objectId, now),
+        )
+      } else if (updates.completed === true) {
+        // Completing cancels unsent notifications so status stays consistent.
+        if (
+          existing.notifyStatus === 'pending' ||
+          existing.notifyStatus === 'processing'
+        ) {
+          updates.notifyStatus = null
+          updates.notifyStatusUpdatedAt = now
+          updates.notifyClaimedAt = null
+          updates.notifyError = null
+        }
+      }
+
       if (Object.keys(updates).length === 0) {
         return res.status(400).json({
           ok: false,
@@ -852,7 +944,7 @@ async function start() {
         })
       }
 
-      updates.updatedAt = new Date()
+      updates.updatedAt = now
 
       const result = await remindersCollection().findOneAndUpdate(
         { _id: objectId, userId },
@@ -916,6 +1008,22 @@ async function start() {
 
   app.listen(PORT, HOST, () => {
     console.log(`PeoplesNote API listening on http://${HOST}:${PORT}`)
+    if (emailConfigured()) {
+      startReminderEmailLoop({
+        remindersCollection: remindersCollection(),
+        usersCollection: usersCollection(),
+        sendEmail: sendViaResend,
+        emailFrom: EMAIL_FROM,
+        isConfigured: emailConfigured,
+      })
+      console.log(
+        'Reminder email scheduler started (1-minute loop; submitted ≠ delivered)',
+      )
+    } else {
+      console.log(
+        'Reminder email scheduler idle — set RESEND_API_KEY and EMAIL_FROM to enable',
+      )
+    }
   })
 }
 

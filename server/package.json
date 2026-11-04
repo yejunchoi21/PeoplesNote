@@ -7,7 +7,7 @@
     "start": "node index.js",
     "dev": "node --watch index.js",
     "migrate:ownership": "node migrate-ownership.js",
-    "test": "node tests/notification-fields.test.mjs && node tests/isolation.mjs",
+    "test": "node tests/notification-fields.test.mjs && node tests/reminder-email-scheduler.test.mjs && node tests/isolation.mjs",
     "cleanup:test-accounts": "node cleanup-test-accounts.js"
   },
   "dependencies": {
