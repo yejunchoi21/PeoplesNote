@@ -68,6 +68,9 @@ function serializeUser(doc) {
   return {
     id: String(doc._id),
     email: doc.email,
+    // Default true for older accounts that predate this field.
+    reminderEmailsEnabled: doc.reminderEmailsEnabled !== false,
+    reminderEmailsEnabledAt: doc.reminderEmailsEnabledAt ?? null,
   }
 }
 
@@ -94,20 +97,41 @@ function serializeReminder(doc) {
     notifyStatusUpdatedAt: rest.notifyStatusUpdatedAt ?? null,
     notifySubmittedAt: rest.notifySubmittedAt ?? null,
     notifyFailedAt: rest.notifyFailedAt ?? null,
+    notifyNextAttemptAt: rest.notifyNextAttemptAt ?? null,
+    notifyAttemptCount: Number(rest.notifyAttemptCount) || 0,
     notifyError: rest.notifyError ?? null,
     notifyProviderId: rest.notifyProviderId ?? null,
   }
 }
 
+function parseRetryAfterSeconds(headers) {
+  if (!headers || typeof headers !== 'object') return null
+  const raw =
+    headers['retry-after'] ??
+    headers['Retry-After'] ??
+    headers['ratelimit-reset'] ??
+    headers['RateLimit-Reset']
+  if (raw == null) return null
+  const n = Number(raw)
+  return Number.isFinite(n) && n > 0 ? n : null
+}
+
 async function sendViaResend({ from, to, subject, text, idempotencyKey }) {
   const resend = new Resend(RESEND_API_KEY)
   const options = idempotencyKey ? { idempotencyKey } : undefined
-  const { data, error } = await resend.emails.send(
+  const response = await resend.emails.send(
     { from, to, subject, text },
     options,
   )
+  const { data, error, headers } = response || {}
   if (error) {
-    return { ok: false, error: error.message || 'Email provider rejected the request' }
+    return {
+      ok: false,
+      error: error.message || 'Email provider rejected the request',
+      name: error.name || error.type || undefined,
+      statusCode: error.statusCode || undefined,
+      retryAfterSeconds: parseRetryAfterSeconds(headers),
+    }
   }
   return { ok: true, id: data?.id || null }
 }
@@ -344,10 +368,13 @@ async function start() {
       }
 
       const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS)
+      const createdAt = new Date()
       const doc = {
         email,
         passwordHash,
-        createdAt: new Date(),
+        createdAt,
+        reminderEmailsEnabled: true,
+        reminderEmailsEnabledAt: createdAt,
       }
 
       let result
@@ -368,7 +395,12 @@ async function start() {
 
       res.status(201).json({
         ok: true,
-        user: { id: String(result.insertedId), email },
+        user: serializeUser({
+          _id: result.insertedId,
+          email,
+          reminderEmailsEnabled: true,
+          reminderEmailsEnabledAt: createdAt,
+        }),
         csrfToken: req.session.csrfToken,
       })
     } catch (err) {
@@ -451,8 +483,82 @@ async function start() {
   app.use('/api/notifications', requireAuth, requireCsrf)
 
   /**
+   * Account-level reminder email preference (separate from per-reminder notify).
+   * Re-enabling stamps reminderEmailsEnabledAt so missed notifies are skipped.
+   */
+  app.get('/api/notifications/preferences', async (req, res) => {
+    try {
+      const userId = sessionUserId(req)
+      const user = await usersCollection().findOne({ _id: userId })
+      if (!user) {
+        return res.status(401).json({
+          ok: false,
+          message: 'Authentication required',
+        })
+      }
+      res.json({
+        ok: true,
+        reminderEmailsEnabled: user.reminderEmailsEnabled !== false,
+        reminderEmailsEnabledAt: user.reminderEmailsEnabledAt ?? null,
+      })
+    } catch (err) {
+      console.error('GET /api/notifications/preferences failed:', err.message)
+      res.status(500).json({
+        ok: false,
+        message: 'Failed to load notification preferences',
+      })
+    }
+  })
+
+  app.patch('/api/notifications/preferences', async (req, res) => {
+    try {
+      const userId = sessionUserId(req)
+      if (typeof req.body?.reminderEmailsEnabled !== 'boolean') {
+        return res.status(400).json({
+          ok: false,
+          message: 'reminderEmailsEnabled (boolean) is required',
+        })
+      }
+
+      const now = new Date()
+      const updates = {
+        reminderEmailsEnabled: req.body.reminderEmailsEnabled,
+        updatedAt: now,
+      }
+      // Re-enabling must not flush a backlog of missed notifications.
+      if (req.body.reminderEmailsEnabled) {
+        updates.reminderEmailsEnabledAt = now
+      }
+
+      const result = await usersCollection().findOneAndUpdate(
+        { _id: userId },
+        { $set: updates },
+        { returnDocument: 'after' },
+      )
+      const user = result?.value ?? result
+      if (!user || !user._id) {
+        return res.status(401).json({
+          ok: false,
+          message: 'Authentication required',
+        })
+      }
+
+      res.json({
+        ok: true,
+        user: serializeUser(user),
+      })
+    } catch (err) {
+      console.error('PATCH /api/notifications/preferences failed:', err.message)
+      res.status(500).json({
+        ok: false,
+        message: 'Failed to update notification preferences',
+      })
+    }
+  })
+
+  /**
    * Manual test email — only to the signed-in user's account email.
-   * Does not schedule reminder emails; acceptance = provider submitted.
+   * Acceptance = provider submitted (not inbox delivery).
    */
   app.post(
     '/api/notifications/test-email',
@@ -928,12 +1034,14 @@ async function start() {
         // Completing cancels unsent notifications so status stays consistent.
         if (
           existing.notifyStatus === 'pending' ||
+          existing.notifyStatus === 'retrying' ||
           existing.notifyStatus === 'processing'
         ) {
-          updates.notifyStatus = null
+          updates.notifyStatus = 'skipped'
           updates.notifyStatusUpdatedAt = now
           updates.notifyClaimedAt = null
-          updates.notifyError = null
+          updates.notifyNextAttemptAt = null
+          updates.notifyError = 'Reminder was completed before the email was sent'
         }
       }
 
